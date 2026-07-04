@@ -10,7 +10,7 @@ int main(int argc, char *argv[])
     QDir::setCurrent(appDir);
 
     LoginWindow loginWindow;
-    loginWindow.show();
+    loginWindow.showMaximized();
 
     return app.exec();
 }

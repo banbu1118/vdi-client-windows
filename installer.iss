@@ -1,5 +1,5 @@
 #define MyAppName "VDI Client"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.5.0"
 #define MyAppPublisher "VDI"
 #define MyAppURL "https://www.vdi.com"
 #define MyAppExeName "VDIClient.exe"
