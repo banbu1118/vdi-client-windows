@@ -1,0 +1,12 @@
+# ===== Build directories =====
+*/build/
+*/build-*/
+freerdp-3.28.0/build/
+freerdp-3.28.0/install/
+qfreerdp-windows/build/
+vdi-client-windows-main/build/
+
+# ===== Packaging/copy artifacts =====
+vdi-client-windows-main/bin/
+vdi-client-windows-main/drivers/
+vdi-client-windows-main/qf-client.exe

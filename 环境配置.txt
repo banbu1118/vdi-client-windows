@@ -1,0 +1,36 @@
+1.安装choco
+powershell管理员权限安装choco，重启生效
+Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+2.安装vs2022
+choco install -y VisualStudio2022Community
+打开visual studio install安装c++桌面开发
+3.安装ninja
+choco install -y ninja
+5.安装git
+choco install -y git
+6.安装vcpkg
+mkdir workspace
+cd workspace
+git clone https://github.com/microsoft/vcpkg.git
+
+#如果下载失败，可以配置http代理
+#git config --global http.proxy http://192.168.1.12:1081
+#git config --global https.proxy http://192.168.1.12:1081
+
+#验证http代理是否配置完成
+#git config --global --get http.proxy
+#git config --global --get https.proxy
+
+#初始化vckg
+.\vcpkg\bootstrap-vcpkg.bat
+
+#记得添加环境变量！！！
+7.安装freerdp依赖
+vcpkg install zlib:x64-windows openssl:x64-windows ffmpeg[x264]:x64-windows libusb:x64-windows spdlog:x64-windows openh264:x64-windows
+#下载失败时可以配置http代理
+set HTTP_PROXY=http://192.168.1.12:1081
+set HTTPS_PROXY=http://192.168.1.12:1081
+8.安装qt
+安装时选择自定义安装，勾选msvc编译器
+qt-online-installer-windows-x64-4.10.0.exe --mirror https://mirrors.ustc.edu.cn/qtproject
+#添加环境变量
