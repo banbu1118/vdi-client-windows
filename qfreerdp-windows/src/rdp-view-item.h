@@ -621,6 +621,36 @@ public:
 
     void keyboardUnicodeEventSend(QKeyEvent* event, bool down) {
         if (!m_rdpContext) return;
+
+        const int qkey = event->key();
+        const Qt::KeyboardModifiers mods = event->modifiers();
+
+        /* 忽略本地 Ctrl+Alt+Del：系统安全序列（SAK）应用本就无法捕获，
+         * 无需转发；如需发送由工具栏 sendCtrlAltDelete() 完成。 */
+        if (qkey == Qt::Key_Delete &&
+            (mods & Qt::ControlModifier) && (mods & Qt::AltModifier)) {
+            return;
+        }
+
+        /* 组合键（任一修饰键 + 非修饰键）统一使用物理扫描码转发，不逐个映射。
+         * Qt 在组合键下会把 key 报为"转换后的字符键"（如 Shift+= 报 Key_Plus、
+         * Shift+1 报 Key_Exclam、Ctrl+Shift+2 报 Key_At），映射表按物理键的 Qt 键值
+         * 编写无法覆盖所有组合；而 nativeScanCode 是物理键的原始 PS/2 扫描码
+         * （Windows 下与 RDP 扫描码编码一致），远端结合已收到的修饰键状态即可正确解析。 */
+        const bool hasModifier =
+            mods & (Qt::ShiftModifier | Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier);
+        const bool isModifierKey =
+            (qkey == Qt::Key_Shift || qkey == Qt::Key_Control ||
+             qkey == Qt::Key_Alt || qkey == Qt::Key_Meta);
+        if (hasModifier && !isModifierKey) {
+            const quint32 native = event->nativeScanCode();
+            if (native != 0) {
+                freerdp_input_send_keyboard_event_ex(m_rdpContext->input, down,
+                                                     down && event->isAutoRepeat(), native);
+                return;
+            }
+        }
+
         UINT32 freerdp_key_code = qf::to_freerdp_key_code(event);
         if (freerdp_key_code == RDP_SCANCODE_UNKNOWN) {
             uint16_t flags = down ? 0 : KBD_FLAGS_RELEASE;

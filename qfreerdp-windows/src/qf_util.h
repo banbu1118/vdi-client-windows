@@ -91,6 +91,8 @@ inline UINT to_freerdp_key_code(const QKeyEvent* event)
 
         case Qt::Key_Minus: return RDP_SCANCODE_OEM_MINUS;
         case Qt::Key_Equal: return RDP_SCANCODE_OEM_PLUS;
+        /* 主键盘 '+'（Shift + '='）：物理扫描码同为 0x0D，由远端 shift 状态产生 '+' */
+        case Qt::Key_Plus: return RDP_SCANCODE_OEM_PLUS;
         case Qt::Key_BracketLeft: return RDP_SCANCODE_OEM_4;
         case Qt::Key_BracketRight: return RDP_SCANCODE_OEM_6;
         case Qt::Key_Backslash: return RDP_SCANCODE_OEM_5;
@@ -133,7 +135,18 @@ inline UINT to_freerdp_key_code(const QKeyEvent* event)
         case Qt::Key_F11: return RDP_SCANCODE_F11;
         case Qt::Key_F12: return RDP_SCANCODE_F12;
 
-        default: return RDP_SCANCODE_UNKNOWN;
+        default:
+        {
+            /* 映射表盲区回退：使用 Qt 提供的真实物理扫描码。
+             * Windows 下 QKeyEvent::nativeScanCode() 编码与 RDP 扫描码完全一致：
+             * 低 8 位为 PS/2 扫描码，0x0100 位为 extended 标志（KBDEXT）。
+             * 覆盖主键盘符号键（Shift+1 的 '!'、Shift+= 的 '+' 等）这类 Qt 报告为
+             * Key_Exclam/Key_Plus 而映射表缺失的键，避免落入 unicode 回退。 */
+            const quint32 native = event->nativeScanCode();
+            if (native != 0)
+                return static_cast<UINT>(native);
+            return RDP_SCANCODE_UNKNOWN;
+        }
     }
 }
 
