@@ -31,6 +31,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <d3d11.h>
 
+/* WH_KEYBOARD_LL / KBDLLHOOKSTRUCT: 拦截系统级 Win 组合键（如 Win+R）并转发给 RDP */
+#include <windows.h>
+
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -325,6 +328,17 @@ public:
         if (auto* app = QGuiApplication::instance())
             app->installEventFilter(this);
 
+        /* 安装 WH_KEYBOARD_LL 低级键盘钩子拦截 Win 组合键：仅在客户端窗口
+         * 处于前台时启用，离开前台（Alt-Tab）后停用，不影响其他应用。 */
+        if (auto* app = qApp)
+        {
+            QObject::connect(app, &QGuiApplication::focusWindowChanged,
+                             this, &RdpViewItem::onFocusWindowChanged);
+            /* 窗口可能在 connect 前就已获得焦点（focusWindowChanged 不会补发），
+             * 主动检查一次当前焦点窗口。 */
+            onFocusWindowChanged(app->focusWindow());
+        }
+
         connect(QGuiApplication::clipboard(), &QClipboard::dataChanged,
                 this, &RdpViewItem::dataChangedCallback);
 
@@ -356,6 +370,368 @@ public:
         return false;
     }
 
+    /* =====================================================================
+     * Win 组合键拦截（WH_KEYBOARD_LL 低级键盘钩子）
+     *
+     * 背景：Win+字母组合是客户端 shell 的系统级快捷键。RegisterHotKey 对
+     * Win 组合键被系统保留、注册必然失败，且 Qt 的 ShortcutOverride 也拦
+     * 不住。唯一可靠做法：安装 WH_KEYBOARD_LL 低级键盘钩子，它在系统把
+     * 按键路由给任何窗口/shell 之前执行——返回非零即可在本地吞掉按键，
+     * 同时由我们把按键序列主动转发给 RDP 会话。
+     *
+     * 策略（仅客户端窗口处于前台时生效）：
+     *   - Win 键按下/弹起：本地吞掉（本地开始菜单不再弹出）；
+     *   - Win 按住时按下登记的组合键（isInterceptedWinCombo）：吞掉该键，
+     *     转发 Win+键 到 RDP（VM 内执行对应系统功能）；
+     *   - 单独按 Win（未接组合键）：转发裸 Win（VM 内打开开始菜单）；
+     *   - Alt+Tab / Alt+Shift+Tab：吞掉 Tab，转发到 RDP（VM 内切换窗口）；
+     *   - Ctrl+Alt+Del 不在此处理（工具栏 sendCtrlAltDelete() 单独发送）。
+     * ===================================================================== */
+
+    static inline RdpViewItem* s_hookInstance = nullptr;
+
+    /* 低级键盘钩子回调：由安装钩子的线程（GUI 主线程）调用 */
+    static LRESULT CALLBACK lowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+    {
+        if (nCode == HC_ACTION && s_hookInstance)
+            return s_hookInstance->handleLowLevelKey(wParam, lParam);
+        return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    }
+
+    /* 窗口处于前台（激活）时启用钩子，离开前台后停用（按键透传给系统） */
+    void onFocusWindowChanged(QWindow* window)
+    {
+        if (window)
+            enableKeyboardHook();
+        else
+            disableKeyboardHook();
+    }
+
+    void enableKeyboardHook()
+    {
+        if (m_kbHook)
+            return;
+        s_hookInstance = this;
+        m_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, lowLevelKeyboardProc,
+                                     GetModuleHandleW(nullptr), 0);
+        if (m_kbHook)
+            qf::log::info("hotkey/win", "WH_KEYBOARD_LL hook installed");
+        else
+            qf::log::warn("hotkey/win", "SetWindowsHookEx failed, error={}",
+                          static_cast<int>(GetLastError()));
+    }
+
+    void disableKeyboardHook()
+    {
+        if (m_kbHook)
+        {
+            UnhookWindowsHookEx(m_kbHook);
+            m_kbHook = nullptr;
+            m_winDown = false;
+            m_comboDown = false;
+            m_comboFired = false;
+            m_comboScanCode = 0;
+            m_altDown = false;
+            m_altActive = false;
+            m_shiftForwarded = false;
+            m_shiftHeld = false;
+            m_shiftOwned = false;
+            m_snapshotAlt = false;
+            m_ctrlDown = false;
+            m_caeHandled = false;
+            qf::log::info("hotkey/win", "WH_KEYBOARD_LL hook removed");
+        }
+        if (s_hookInstance == this)
+            s_hookInstance = nullptr;
+    }
+
+    LRESULT handleLowLevelKey(WPARAM wParam, LPARAM lParam)
+    {
+        const auto* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        if (!kb)
+            return CallNextHookEx(nullptr, HC_ACTION, wParam, lParam);
+
+        /* 注入的按键（如其它工具 SendInput 产生的）不拦截 */
+        if (kb->flags & LLKHF_INJECTED)
+            return CallNextHookEx(nullptr, HC_ACTION, wParam, lParam);
+
+        const bool isWinKey = (kb->vkCode == VK_LWIN || kb->vkCode == VK_RWIN);
+        const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        const bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+
+        if (isWinKey)
+        {
+            if (isDown)
+            {
+                if (!m_winDown)
+                {
+                    m_winDown = true;
+                    m_comboDown = false; /* 新一轮 Win 会话 */
+                    m_comboFired = false;
+                }
+                return 1; /* 本地吞掉，开始菜单不弹出 */
+            }
+            if (isUp)
+            {
+                m_winDown = false;
+                if (!m_comboFired)
+                {
+                    /* 本轮未触发任何组合键：转发裸 Win，打开远端开始菜单 */
+                    forwardRdpKey(true, RDP_SCANCODE_LWIN);
+                    forwardRdpKey(false, RDP_SCANCODE_LWIN);
+                }
+                m_comboFired = false;
+                return 1;
+            }
+        }
+
+        /* Win 按住时按下/弹起登记的组合键：吞掉并转发给 RDP（本地 shell 不执行） */
+        if (m_winDown && isInterceptedWinCombo(kb->vkCode))
+        {
+            const UINT scancode = winComboScanCode(kb->vkCode);
+            if (isDown)
+            {
+                if (!m_comboDown)
+                {
+                    m_comboDown = true;
+                    m_comboFired = true; /* 本轮已消费组合键，Win 弹起时不再补裸 Win */
+                    m_comboScanCode = scancode;
+                    forwardRdpKey(true, RDP_SCANCODE_LWIN);
+                    if (m_shiftHeld && !m_shiftOwned) /* Win+Shift+组合（如 Win+Shift+S 截图） */
+                    {
+                        m_shiftOwned = true;
+                        forwardRdpKey(true, RDP_SCANCODE_LSHIFT);
+                    }
+                    forwardRdpKey(true, scancode);
+                }
+                return 1;
+            }
+            if (isUp)
+            {
+                if (m_comboDown && m_comboScanCode == scancode)
+                {
+                    m_comboDown = false;
+                    forwardRdpKey(false, scancode);
+                    if (m_shiftOwned && !m_shiftHeld)
+                    {
+                        m_shiftOwned = false;
+                        forwardRdpKey(false, RDP_SCANCODE_LSHIFT);
+                    }
+                    forwardRdpKey(false, RDP_SCANCODE_LWIN);
+                }
+                return 1;
+            }
+        }
+
+        /* PrintScreen / Alt+PrintScreen：本地吞掉并转发给 RDP（VM 内截图）。
+         * 与 mstsc 行为一致；Win 按住时走上面的 Win+PrintScreen 组合分支。 */
+        if (kb->vkCode == VK_SNAPSHOT && !m_winDown)
+        {
+            if (isDown)
+            {
+                const bool altHeld = m_altDown || (kb->flags & LLKHF_ALTDOWN);
+                if (altHeld && !m_snapshotAlt)
+                {
+                    m_snapshotAlt = true;
+                    forwardRdpKey(true, RDP_SCANCODE_LMENU);
+                }
+                forwardRdpKey(true, RDP_SCANCODE_PRINTSCREEN);
+            }
+            else
+            {
+                forwardRdpKey(false, RDP_SCANCODE_PRINTSCREEN);
+                if (!m_altDown && m_snapshotAlt) /* 物理 Alt 已松开时补发远端 Alt 弹起 */
+                {
+                    m_snapshotAlt = false;
+                    forwardRdpKey(false, RDP_SCANCODE_LMENU);
+                }
+            }
+            return 1;
+        }
+
+        /* Ctrl+Alt+Enter：本地吞掉并切换本地全屏/窗口模式（mstsc 风格），不转发 VM。
+         * 仅在全新按下时触发一次，避免按住时重复切换。 */
+        if (kb->vkCode == VK_RETURN && m_ctrlDown && m_altDown)
+        {
+            if (isDown && !m_caeHandled)
+            {
+                m_caeHandled = true;
+                emit toggleFullscreenRequested();
+            }
+            return 1; /* 本地吞掉，Ctrl+Alt+Enter 不进入远端 */
+        }
+
+        /* Alt+Tab / Alt+Shift+Tab：本地吞掉 Tab，转发到 RDP（VM 内切换窗口）。
+         * 仅吞 Tab 即可阻止本地任务切换器弹出（Alt 仍透传给本地，不影响 Alt+F4 等）。
+         * 按住 Alt 期间远端 Alt 保持按住：首次 Tab 打开切换器，后续每次 Tab 移动
+         * 选择，直到物理 Alt 松开才确认并关闭切换器，支持自由选择窗口。 */
+        if (kb->vkCode == VK_TAB && (m_altDown || (kb->flags & LLKHF_ALTDOWN)))
+        {
+            if (isDown)
+            {
+                if (!m_altActive)
+                {
+                    m_altActive = true;
+                    m_shiftForwarded = false;
+                    forwardRdpKey(true, RDP_SCANCODE_LMENU);
+                    if (m_shiftHeld)
+                    {
+                        m_shiftForwarded = true;
+                        forwardRdpKey(true, RDP_SCANCODE_LSHIFT);
+                    }
+                }
+                forwardRdpKey(true, RDP_SCANCODE_TAB); /* 每按一次 Tab 移动一次选择 */
+                return 1; /* 本地吞掉 Tab，本地任务切换器不会弹出 */
+            }
+            if (isUp)
+            {
+                /* 保持 Alt 按住，切换器不关闭 */
+                forwardRdpKey(false, RDP_SCANCODE_TAB);
+                return 1;
+            }
+        }
+
+        /* Alt / Shift 键状态跟踪（识别 Alt+Tab 与反向切换） */
+        if (kb->vkCode == VK_MENU || kb->vkCode == VK_LMENU || kb->vkCode == VK_RMENU)
+        {
+            if (isDown)
+            {
+                m_altDown = true;
+            }
+            else
+            {
+                m_altDown = false;
+                m_caeHandled = false; /* 组合松开，允许下次 Ctrl+Alt+Enter */
+                if (m_altActive)
+                {
+                    /* 松开 Alt：补发 Shift/Alt 弹起，确认选择并关闭远端切换器 */
+                    m_altActive = false;
+                    if (m_shiftForwarded)
+                    {
+                        m_shiftForwarded = false;
+                        forwardRdpKey(false, RDP_SCANCODE_LSHIFT);
+                    }
+                    forwardRdpKey(false, RDP_SCANCODE_LMENU);
+                }
+                else if (m_snapshotAlt) /* Alt+PrintScreen 后补发远端 Alt 弹起 */
+                {
+                    m_snapshotAlt = false;
+                    forwardRdpKey(false, RDP_SCANCODE_LMENU);
+                }
+            }
+        }
+        else if (kb->vkCode == VK_SHIFT || kb->vkCode == VK_LSHIFT || kb->vkCode == VK_RSHIFT)
+        {
+            m_shiftHeld = isDown;
+            if (m_altActive)
+            {
+                if (isDown && !m_shiftForwarded)
+                {
+                    m_shiftForwarded = true;
+                    forwardRdpKey(true, RDP_SCANCODE_LSHIFT);
+                }
+                else if (!isDown && m_shiftForwarded)
+                {
+                    m_shiftForwarded = false;
+                    forwardRdpKey(false, RDP_SCANCODE_LSHIFT);
+                }
+            }
+            else if (!isDown && m_shiftOwned) /* Win+Shift+组合 后物理 Shift 弹起：补发远端弹起 */
+            {
+                m_shiftOwned = false;
+                forwardRdpKey(false, RDP_SCANCODE_LSHIFT);
+            }
+        }
+        else if (kb->vkCode == VK_CONTROL || kb->vkCode == VK_LCONTROL || kb->vkCode == VK_RCONTROL)
+        {
+            m_ctrlDown = isDown;
+            if (!isDown)
+                m_caeHandled = false; /* Ctrl 松开后允许下次 Ctrl+Alt+Enter */
+        }
+
+        return CallNextHookEx(nullptr, HC_ACTION, wParam, lParam);
+    }
+
+    /* 需要转发给 RDP 的 Win+组合键登记表（本地 shell 的常见系统快捷键）。
+     * 注：Win+Shift+S 由 'S' + Shift 状态处理（不单独登记）。 */
+    static bool isInterceptedWinCombo(UINT vkCode)
+    {
+        switch (vkCode)
+        {
+            case 'R': /* 运行 */
+            case 'E': /* 资源管理器 */
+            case 'D': /* 显示桌面 */
+            case 'I': /* 设置 */
+            case 'M': /* 最小化所有窗口 */
+            case 'X': /* 快速链接菜单 */
+            case 'S': /* 搜索（含 Win+Shift+S 截图） */
+            case 'Q': /* 搜索（Win11 与 Win+S 等价） */
+            case 'V': /* 剪贴板历史 */
+            case 'G': /* 游戏栏/录屏 */
+            case 'P': /* 投影 */
+            case 'A': /* 快速设置 */
+            case 'W': /* 小组件 */
+            case 'T': /* 任务栏循环 */
+            case 'B': /* 聚焦通知区域 */
+            case 'U': /* 辅助功能设置 */
+            case '0':
+            case '1':
+            case '2':
+            case '3':
+            case '4':
+            case '5':
+            case '6':
+            case '7':
+            case '8':
+            case '9': /* Win+数字：启动/切换任务栏第 N 个应用 */
+            case VK_HOME:       /* 最小化除当前窗口外所有 */
+            case VK_SNAPSHOT:   /* 截图并保存（Win+PrintScreen） */
+            case VK_OEM_PERIOD: /* 表情面板（Win+.） */
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /* VK 码 → RDP 扫描码。注意：PS/2 扫描码并非按字母顺序线性排列
+     * （如 V 的扫描码 0x2F 恰在 R 附近），必须用每键的准确常量。 */
+    static constexpr UINT kScancodesAtoZ[26] = {
+        RDP_SCANCODE_KEY_A, RDP_SCANCODE_KEY_B, RDP_SCANCODE_KEY_C, RDP_SCANCODE_KEY_D,
+        RDP_SCANCODE_KEY_E, RDP_SCANCODE_KEY_F, RDP_SCANCODE_KEY_G, RDP_SCANCODE_KEY_H,
+        RDP_SCANCODE_KEY_I, RDP_SCANCODE_KEY_J, RDP_SCANCODE_KEY_K, RDP_SCANCODE_KEY_L,
+        RDP_SCANCODE_KEY_M, RDP_SCANCODE_KEY_N, RDP_SCANCODE_KEY_O, RDP_SCANCODE_KEY_P,
+        RDP_SCANCODE_KEY_Q, RDP_SCANCODE_KEY_R, RDP_SCANCODE_KEY_S, RDP_SCANCODE_KEY_T,
+        RDP_SCANCODE_KEY_U, RDP_SCANCODE_KEY_V, RDP_SCANCODE_KEY_W, RDP_SCANCODE_KEY_X,
+        RDP_SCANCODE_KEY_Y, RDP_SCANCODE_KEY_Z,
+    };
+
+    static UINT winComboScanCode(UINT vkCode)
+    {
+        if (vkCode >= 'A' && vkCode <= 'Z')
+            return kScancodesAtoZ[vkCode - 'A'];
+        /* 主键盘数字行：1-9 连续（0x02-0x0A），0 在末尾（0x0B） */
+        if (vkCode >= '1' && vkCode <= '9')
+            return static_cast<UINT>(RDP_SCANCODE_KEY_1 + (vkCode - '1'));
+        if (vkCode == '0')
+            return RDP_SCANCODE_KEY_0;
+        switch (vkCode)
+        {
+            case VK_HOME:        return RDP_SCANCODE_HOME;
+            case VK_SNAPSHOT:    return RDP_SCANCODE_PRINTSCREEN;
+            case VK_OEM_PERIOD:  return RDP_SCANCODE_OEM_PERIOD;
+            default:             return 0;
+        }
+    }
+
+    /* 向 RDP 会话发送单个按键事件 */
+    void forwardRdpKey(bool down, UINT scancode)
+    {
+        if (!m_rdpContext || !m_rdpContext->input)
+            return;
+        freerdp_input_send_keyboard_event_ex(m_rdpContext->input,
+                                             down ? TRUE : FALSE, FALSE, scancode);
+    }
+
     /* DEBUG: track geometry changes */
     void geometryChange(const QRectF& newGeometry, const QRectF& oldGeometry) override
     {
@@ -371,6 +747,7 @@ public:
 
     ~RdpViewItem() override
     {
+        disableKeyboardHook();
     }
 
     /* Expose current RDP resolution to QML for poll logging. */
@@ -816,6 +1193,7 @@ signals:
     void rdpGeometryChanged();
     void clipboardDataResponseFromRemote();
     void fullscreenChanged();
+    void toggleFullscreenRequested(); /* Ctrl+Alt+Enter 本地全屏切换请求 */
 
 private:
     /* Frame buffer — CPU-side copy of the decoded frame */
@@ -839,4 +1217,19 @@ private:
     std::shared_ptr<qf::client_t>     m_qfClientContext;
     bool                              m_clipboardDataFromRemote = false;
     bool                              m_fullscreen = false;
+
+    /* Win 组合键低级键盘钩子状态 */
+    HHOOK m_kbHook = nullptr;
+    bool  m_winDown     = false; /* 客户端 Win 键当前是否按住 */
+    bool  m_comboDown   = false; /* Win+组合键是否已按下并转发 */
+    bool  m_comboFired  = false; /* 本轮 Win 会话是否已消费过组合键 */
+    UINT  m_comboScanCode = 0;   /* 已转发的组合键 RDP 扫描码 */
+    bool  m_altDown        = false; /* Alt 键当前是否按住 */
+    bool  m_altActive      = false; /* 远端 Alt 是否已按下（Alt+Tab 会话进行中） */
+    bool  m_shiftForwarded = false; /* 远端 Shift 是否已按下（反向切换用） */
+    bool  m_shiftHeld      = false; /* Shift 键当前是否按住（Alt+Shift+Tab 反向切换） */
+    bool  m_shiftOwned     = false; /* 远端 Shift 是否已按下（Win+Shift+组合 转发用） */
+    bool  m_snapshotAlt    = false; /* 远端 Alt 是否已按下（Alt+PrintScreen 转发用） */
+    bool  m_ctrlDown       = false; /* Ctrl 键当前是否按住 */
+    bool  m_caeHandled     = false; /* Ctrl+Alt+Enter 是否已触发（防重复） */
 };

@@ -85,6 +85,14 @@ Window {
         }
     }
 
+    // Ctrl+Alt+Enter（钩子拦截）→ 本地全屏/窗口切换
+    Connections {
+        target: rdpItem
+        function onToggleFullscreenRequested() {
+            root.toggleDisplayMode()
+        }
+    }
+
     // ========== Overlay 悬浮工具栏（独立，不影响 RDP 渲染区域） ==========
 
     // 屏幕顶部 5px 热区 — 仅检测鼠标进入，不阻挡 RDP 交互

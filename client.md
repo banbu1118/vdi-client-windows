@@ -94,7 +94,56 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
 - **连接参数**：兼容 FreeRDP 命令行（`/v:`、`/u:`、`/p:`、`/cert:ignore`、`/f`、`/clipboard:`、`/usb:`、`/drive:`），也支持 `.rdp` 文件；忽略 `.rdp` 内分辨率、强制使用窗口/屏幕尺寸。
 - **稳定性**：TCP 连接超时 15s、瞬态失败自动重试 3 次、USB 变化自动重连、证书忽略验证、GFX 开启（H264 + AVC444/444v2、ThinClient）。
 
-### 3.5 构建与部署（build-qf-client.ps1）
+### 3.5 快捷键拦截（WH_KEYBOARD_LL 键盘钩子）
+
+**机制**：客户端窗口处于前台（获得焦点）时安装 `WH_KEYBOARD_LL` 低级键盘钩子，离开前台自动卸载（不影响其他应用）。钩子在系统把按键路由给任何窗口/本地 shell 之前执行——对需要拦截的按键返回非零以在本地吞掉，同时把按键序列以 RDP 扫描码通过 `freerdp_input_send_keyboard_event_ex` 转发给远端会话。实现位于 `rdp-view-item.h`（`enableKeyboardHook` / `handleLowLevelKey` / `forwardRdpKey`）。
+
+**拦截并转发到 VM 的按键**：
+
+| 按键 | 本地行为 | 远端（VM）行为 |
+|---|---|---|
+| `Win` | 吞掉（本地开始菜单不弹出） | 打开开始菜单（裸 Win，仅在未接组合键时转发一次） |
+| `Win+R` | 吞掉 | 打开"运行"对话框 |
+| `Win+E` | 吞掉 | 打开资源管理器 |
+| `Win+D` | 吞掉 | 显示桌面 |
+| `Win+I` | 吞掉 | 打开设置 |
+| `Win+M` | 吞掉 | 最小化所有窗口 |
+| `Win+X` | 吞掉 | 打开快速链接菜单 |
+| `Win+S` | 吞掉 | 打开搜索 |
+| `Win+Shift+S` | 吞掉 | 打开截图工具（区域截图） |
+| `Win+Q` | 吞掉 | 打开搜索（Win11 与 Win+S 等价） |
+| `Win+V` | 吞掉 | 打开剪贴板历史 |
+| `Win+G` | 吞掉 | 打开游戏栏/录屏 |
+| `Win+P` | 吞掉 | 打开投影设置 |
+| `Win+A` | 吞掉 | 打开快速设置 |
+| `Win+W` | 吞掉 | 打开小组件 |
+| `Win+T` | 吞掉 | 循环聚焦任务栏（VM 内） |
+| `Win+B` | 吞掉 | 聚焦通知区域 |
+| `Win+U` | 吞掉 | 打开辅助功能设置 |
+| `Win+数字键 1-9/0` | 吞掉 | 启动/切换任务栏第 N 个应用（VM 内） |
+| `Win+Home` | 吞掉 | 最小化除当前窗口外所有窗口 |
+| `Win+.` | 吞掉 | 打开表情面板 |
+| `Win+PrintScreen` | 吞掉 | 截图并保存到本地图片目录（VM 内） |
+| `PrintScreen` | 吞掉（本地不触发截图） | 截取 VM 全屏（同 mstsc） |
+| `Alt+PrintScreen` | 吞掉 | 截取 VM 当前活动窗口 |
+| `Alt+Tab` | 吞掉（本地任务切换器不弹出） | 切换窗口；按住 Alt 期间可连续按 Tab 移动选择、自由挑选窗口，松开 Alt 确认 |
+| `Alt+Shift+Tab` | 吞掉 | 反向切换窗口 |
+
+- 组合键支持任意松开顺序，不会在远端残留卡住的按键；`Win+Shift+S` 由 Shift 状态动态加入转发序列，远端 Shift 会在物理 Shift 弹起时同步释放。
+- 可拦截的 Win 组合登记在 `isInterceptedWinCombo()`，增删只需改该 switch；字母键扫描码使用 `kScancodesAtoZ[]` 常量表，特殊键（`VK_HOME` / `VK_SNAPSHOT` / `VK_OEM_PERIOD`）在 `winComboScanCode()` 单独映射，数字键按主键盘数字行 1-9 连续（0x02-0x0A）、0 在末尾（0x0B）处理（PS/2 扫描码非字母序排列，不能用线性偏移）。
+- `PrintScreen` / `Alt+PrintScreen` 在 Win 未按下时由独立分支转发（`RDP_SCANCODE_PRINTSCREEN`，扩展键），复用 Alt 状态跟踪。
+- `Ctrl+Alt+Enter` 由钩子**本地拦截**，切换客户端本地全屏/窗口模式（mstsc 风格，触发 `toggleFullscreenRequested()` 信号 → QML `toggleDisplayMode()`），**不转发 VM**。
+
+**不拦截（系统边界或另有处理）**：
+
+| 按键 | 原因与行为 |
+|---|---|
+| `Ctrl+Alt+Del` | 系统 SAK（Secure Attention Key），用户态无法捕获；由工具栏"发送 Ctrl+Alt+Del"按钮通过 `sendCtrlAltDelete()` 主动发送给远端 |
+| `Win+L` | 系统安全热键，winlogon/Secure Desktop 在内核层截获，用户态钩子收不到；按 `Win+L` 锁**本地**机器（与 mstsc 行为一致） |
+| `Win+Tab` / `Win+方向键` | 由 DWM 在系统层处理，用户态钩子无法可靠拦截 |
+| `Alt+Esc` / `Ctrl+Esc` | 系统保留组合，低级钩子不派发 |
+
+### 3.6 构建与部署（build-qf-client.ps1）
 1. 依赖校验：FreeRDP install 目录、vcpkg toolchain、Qt 6.11.1、VS2022。
 2. CMake + Ninja + MSVC 编译出 `qf-client.exe`。
 3. 部署运行时到 build 目录：
@@ -103,7 +152,7 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
    - FFmpeg（avcodec/avformat/avutil 等）、OpenH264、libx264、zlib；
    - Qt 核心/Quick/Controls 相关 DLL、`platforms/qwindows.dll`、imageformats、iconengines、QML 模块（QtQml/QtQuick/...）、MSVC 运行时（VC143 CRT）。
 
-### 3.6 运行示例
+### 3.7 运行示例
 ```
 qf-client.exe /v:192.168.1.90 /u:administrator /p:123456 /cert:ignore /f
 ```
@@ -154,3 +203,4 @@ qf-client.exe /v:192.168.1.90 /u:administrator /p:123456 /cert:ignore /f
 4. **USB 重定向**：libusb 枚举 + 热插拔回调 → urbdrc 通道 `id:vid:pid` → 触发 RDP 自动重连。
 5. **多进程协作**：VDIClient.exe（管理面）与 qf-client.exe（数据面）解耦，通过 QProcess + 命令行参数（含 .rdp 文件）协作。
 6. **构建链**：vcpkg（依赖）→ FreeRDP（build-freerdp.ps1）→ qf-client（build-qf-client.ps1）→ VDIClient（CMake 拷贝 bin/ 打包）。
+7. **系统快捷键拦截（qf-client）**：`WH_KEYBOARD_LL` 低级键盘钩子仅在客户端窗口前台时启用，本地吞掉 Win/Win+字母/Alt+Tab/PrintScreen 并转发到 RDP 会话（详见 3.5）；`Win+L` 与 `Ctrl+Alt+Del` 属系统安全边界，用户态无法拦截——Win+L 锁本地机器（同 mstsc），Ctrl+Alt+Del 由工具栏按钮发送。
