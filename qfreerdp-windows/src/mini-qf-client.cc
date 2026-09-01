@@ -1545,6 +1545,24 @@ static BOOL my_post_connect(freerdp* instance)
 
 	g_rdpViewItem->setFreeRDP_context(instance->context);
 
+	/* 连接建立后同步本机键盘开关状态（NumLock/CapsLock/ScrollLock）到远端。
+	 * 远端默认 NumLock=OFF，若不同步，小键盘数字键会被当作编辑键（1→End）。 */
+	{
+		rdpInput* input = instance->context->input;
+		UINT32 syncFlags = 0;
+		if (GetKeyState(VK_NUMLOCK) & 1)
+			syncFlags |= KBD_SYNC_NUM_LOCK;
+		if (GetKeyState(VK_CAPITAL) & 1)
+			syncFlags |= KBD_SYNC_CAPS_LOCK;
+		if (GetKeyState(VK_SCROLL) & 1)
+			syncFlags |= KBD_SYNC_SCROLL_LOCK;
+		if (GetKeyState(VK_KANA) & 1)
+			syncFlags |= KBD_SYNC_KANA_LOCK;
+		freerdp_input_send_synchronize_event(input, syncFlags);
+		qf::log::info("rdp/post-connect", "keyboard toggle state synced flags=0x{:08X}",
+		              syncFlags);
+	}
+
 	QMetaObject::invokeMethod(g_rdpViewItem, []() {
 		notify_window_resized();
 	}, Qt::QueuedConnection);

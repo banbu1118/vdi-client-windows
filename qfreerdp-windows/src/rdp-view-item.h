@@ -402,9 +402,32 @@ public:
     void onFocusWindowChanged(QWindow* window)
     {
         if (window)
+        {
             enableKeyboardHook();
+            syncKeyboardToggleState(); /* 回到窗口时重新对齐远端开关状态 */
+        }
         else
             disableKeyboardHook();
+    }
+
+    /* 同步本机键盘开关状态（NumLock/CapsLock/ScrollLock）到 RDP 会话。
+     * 远端默认 NumLock=OFF，若不同步，小键盘数字键（0x47-0x53，与编辑键
+     * 共用扫描码）会被远端按编辑键解释（如 1→End），数字输入就会失灵。 */
+    void syncKeyboardToggleState()
+    {
+        if (!m_rdpContext || !m_rdpContext->input)
+            return;
+        UINT32 syncFlags = 0;
+        if (GetKeyState(VK_NUMLOCK) & 1)
+            syncFlags |= KBD_SYNC_NUM_LOCK;
+        if (GetKeyState(VK_CAPITAL) & 1)
+            syncFlags |= KBD_SYNC_CAPS_LOCK;
+        if (GetKeyState(VK_SCROLL) & 1)
+            syncFlags |= KBD_SYNC_SCROLL_LOCK;
+        if (GetKeyState(VK_KANA) & 1)
+            syncFlags |= KBD_SYNC_KANA_LOCK;
+        freerdp_input_send_synchronize_event(m_rdpContext->input, syncFlags);
+        qf::log::info("keyboard/sync", "toggle state synced flags=0x{:08X}", syncFlags);
     }
 
     void enableKeyboardHook()
