@@ -503,6 +503,20 @@ public:
                     forwardRdpKey(true, RDP_SCANCODE_LWIN);
                     forwardRdpKey(false, RDP_SCANCODE_LWIN);
                 }
+                else if (m_comboDown)
+                {
+                    /* Win 先于组合键弹起：此刻组合键仍按着，当场补发完整释放序列，
+                     * 避免远端 LWIN 卡在按下态（否则之后的普通按键会被远端当成 Win+xxx）。 */
+                    forwardRdpKey(false, m_comboScanCode);
+                    if (m_shiftOwned)
+                    {
+                        m_shiftOwned = false;
+                        forwardRdpKey(false, RDP_SCANCODE_LSHIFT);
+                    }
+                    forwardRdpKey(false, RDP_SCANCODE_LWIN);
+                    m_comboDown = false;
+                    m_comboScanCode = 0;
+                }
                 m_comboFired = false;
                 return 1;
             }
@@ -610,6 +624,31 @@ public:
             {
                 /* 保持 Alt 按住，切换器不关闭 */
                 forwardRdpKey(false, RDP_SCANCODE_TAB);
+                return 1;
+            }
+        }
+
+        /* 本地系统/输入法/软件以注册热键抢先消费、Qt 根本收不到的组合键：
+         *   Ctrl+Space        （切输入法/IDE 补全）
+         *   Ctrl+Shift+Esc    （任务管理器）
+         *   Ctrl+Esc          （开始菜单）
+         * 与 Alt+Tab 同策略：修饰键透传给 Qt 转发（远端 Ctrl/Shift 状态始终真实），
+         * 这里只吞掉触发键并转发给 RDP，本地因此不再弹输入法/任务管理器/开始菜单。
+         * 弹窗（modal）打开时不拦截，保证弹窗内本地快捷键仍可用。 */
+        if (kb->vkCode == VK_SPACE && m_ctrlDown && !m_altDown && !m_winDown)
+        {
+            if (!QGuiApplication::modalWindow())
+            {
+                forwardRdpKey(isDown, RDP_SCANCODE_SPACE);
+                return 1;
+            }
+        }
+        else if (kb->vkCode == VK_ESCAPE && m_ctrlDown && !m_altDown)
+        {
+            if (!QGuiApplication::modalWindow())
+            {
+                /* 远端按收到的 Ctrl/Shift 状态自行解析为 Ctrl+Esc 或 Ctrl+Shift+Esc */
+                forwardRdpKey(isDown, RDP_SCANCODE_ESCAPE);
                 return 1;
             }
         }
@@ -1032,24 +1071,15 @@ public:
             return;
         }
 
-        /* 组合键（任一修饰键 + 非修饰键）统一使用物理扫描码转发，不逐个映射。
-         * Qt 在组合键下会把 key 报为"转换后的字符键"（如 Shift+= 报 Key_Plus、
-         * Shift+1 报 Key_Exclam、Ctrl+Shift+2 报 Key_At），映射表按物理键的 Qt 键值
-         * 编写无法覆盖所有组合；而 nativeScanCode 是物理键的原始 PS/2 扫描码
-         * （Windows 下与 RDP 扫描码编码一致），远端结合已收到的修饰键状态即可正确解析。 */
-        const bool hasModifier =
-            mods & (Qt::ShiftModifier | Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier);
-        const bool isModifierKey =
-            (qkey == Qt::Key_Shift || qkey == Qt::Key_Control ||
-             qkey == Qt::Key_Alt || qkey == Qt::Key_Meta);
-        if (hasModifier && !isModifierKey) {
-            const quint32 native = event->nativeScanCode();
-            if (native != 0) {
-                freerdp_input_send_keyboard_event_ex(m_rdpContext->input, down,
-                                                     down && event->isAutoRepeat(), native);
-                return;
-            }
-        }
+        /* 键码映射采用"映射表优先"：to_freerdp_key_code() 对物理键值（字母/数字/
+         * 方向键/Delete/Home 等）返回权威的 RDP 扫描码常量——尤其是 Delete/方向键/
+         * Home 这类 E0 扩展键，常量自带扩展位（0x100，如 RDP_SCANCODE_DELETE=0x153）。
+         * 不能对带修饰键的扩展键直接用 nativeScanCode() 裸发：若 Qt 返回的物理码缺
+         * 扩展位，扩展键会被远端按小键盘键解释（如 0x53 无扩展 = 小键盘 "."），组合
+         * 键就"失灵"。对 Qt 在组合键下报告的"转换后字符键"（如 Shift+1 报 Key_Exclam、
+         * Shift+2 报 Key_At），映射表没有对应项，to_freerdp_key_code() 内部会回退到
+         * 物理扫描码，远端结合已收到的修饰键状态即可正确解析。
+         * 修饰键本身（Key_Shift/Control/Alt/Meta 按下/弹起）直接落表，不在此处理。 */
 
         UINT32 freerdp_key_code = qf::to_freerdp_key_code(event);
         if (freerdp_key_code == RDP_SCANCODE_UNKNOWN) {

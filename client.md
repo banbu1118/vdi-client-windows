@@ -128,11 +128,15 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
 | `Alt+PrintScreen` | 吞掉 | 截取 VM 当前活动窗口 |
 | `Alt+Tab` | 吞掉（本地任务切换器不弹出） | 切换窗口；按住 Alt 期间可连续按 Tab 移动选择、自由挑选窗口，松开 Alt 确认 |
 | `Alt+Shift+Tab` | 吞掉 | 反向切换窗口 |
+| `Ctrl+Space` | 吞掉（本地输入法不切换） | 切换输入法 / IDE 代码补全（VM 内） |
+| `Ctrl+Shift+Esc` | 吞掉（本地任务管理器不弹出） | 打开任务管理器（VM 内） |
+| `Ctrl+Esc` | 吞掉（本地开始菜单不弹出） | 打开开始菜单（VM 内） |
 
 - 组合键支持任意松开顺序，不会在远端残留卡住的按键；`Win+Shift+S` 由 Shift 状态动态加入转发序列，远端 Shift 会在物理 Shift 弹起时同步释放。
 - 可拦截的 Win 组合登记在 `isInterceptedWinCombo()`，增删只需改该 switch；字母键扫描码使用 `kScancodesAtoZ[]` 常量表，特殊键（`VK_HOME` / `VK_SNAPSHOT` / `VK_OEM_PERIOD`）在 `winComboScanCode()` 单独映射，数字键按主键盘数字行 1-9 连续（0x02-0x0A）、0 在末尾（0x0B）处理（PS/2 扫描码非字母序排列，不能用线性偏移）。
 - `PrintScreen` / `Alt+PrintScreen` 在 Win 未按下时由独立分支转发（`RDP_SCANCODE_PRINTSCREEN`，扩展键），复用 Alt 状态跟踪。
 - `Ctrl+Alt+Enter` 由钩子**本地拦截**，切换客户端本地全屏/窗口模式（mstsc 风格，触发 `toggleFullscreenRequested()` 信号 → QML `toggleDisplayMode()`），**不转发 VM**。
+- `Ctrl+Space` / `Ctrl+Shift+Esc` / `Ctrl+Esc` 属"本地系统/输入法以注册热键抢先消费、Qt 根本收不到"的组合键。处理方式与 Alt+Tab 同策略：修饰键（Ctrl/Shift）经 Qt 透传转发（远端修饰状态始终真实），钩子只吞触发键（Space/Esc）并转发，因此无释放顺序卡键问题；弹窗（modal）打开时不拦截，弹窗内本地快捷键仍可用。
 
 **不拦截（系统边界或另有处理）**：
 
@@ -141,7 +145,7 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
 | `Ctrl+Alt+Del` | 系统 SAK（Secure Attention Key），用户态无法捕获；由工具栏"发送 Ctrl+Alt+Del"按钮通过 `sendCtrlAltDelete()` 主动发送给远端 |
 | `Win+L` | 系统安全热键，winlogon/Secure Desktop 在内核层截获，用户态钩子收不到；按 `Win+L` 锁**本地**机器（与 mstsc 行为一致） |
 | `Win+Tab` / `Win+方向键` | 由 DWM 在系统层处理，用户态钩子无法可靠拦截 |
-| `Alt+Esc` / `Ctrl+Esc` | 系统保留组合，低级钩子不派发 |
+| `Alt+Esc` | 系统保留的 shell 窗口循环组合，未拦截，本地生效 |
 
 ### 3.6 构建与部署（build-qf-client.ps1）
 1. 依赖校验：FreeRDP install 目录、vcpkg toolchain、Qt 6.11.1、VS2022。
@@ -203,4 +207,4 @@ qf-client.exe /v:192.168.1.90 /u:administrator /p:123456 /cert:ignore /f
 4. **USB 重定向**：libusb 枚举 + 热插拔回调 → urbdrc 通道 `id:vid:pid` → 触发 RDP 自动重连。
 5. **多进程协作**：VDIClient.exe（管理面）与 qf-client.exe（数据面）解耦，通过 QProcess + 命令行参数（含 .rdp 文件）协作。
 6. **构建链**：vcpkg（依赖）→ FreeRDP（build-freerdp.ps1）→ qf-client（build-qf-client.ps1）→ VDIClient（CMake 拷贝 bin/ 打包）。
-7. **系统快捷键拦截（qf-client）**：`WH_KEYBOARD_LL` 低级键盘钩子仅在客户端窗口前台时启用，本地吞掉 Win/Win+字母/Alt+Tab/PrintScreen 并转发到 RDP 会话（详见 3.5）；`Win+L` 与 `Ctrl+Alt+Del` 属系统安全边界，用户态无法拦截——Win+L 锁本地机器（同 mstsc），Ctrl+Alt+Del 由工具栏按钮发送。
+7. **系统快捷键拦截（qf-client）**：`WH_KEYBOARD_LL` 低级键盘钩子仅在客户端窗口前台时启用，本地吞掉 Win/Win+字母/Alt+Tab/PrintScreen 及被本地热键抢占的 Ctrl+Space/Ctrl+Shift+Esc/Ctrl+Esc 并转发到 RDP 会话（详见 3.5）；`Win+L` 与 `Ctrl+Alt+Del` 属系统安全边界，用户态无法拦截——Win+L 锁本地机器（同 mstsc），Ctrl+Alt+Del 由工具栏按钮发送。键盘事件转发采用"映射表优先、盲区回退物理扫描码"策略，保证 Delete/方向键等扩展键的 RDP 扩展位正确。
