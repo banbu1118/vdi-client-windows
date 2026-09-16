@@ -95,6 +95,16 @@ Window {
 
     // ========== Overlay 悬浮工具栏（独立，不影响 RDP 渲染区域） ==========
 
+    // 鼠标在顶部热区停留满 1s 才浮现工具栏（避免划过顶部就弹出）
+    Timer {
+        id: showDelayTimer
+        interval: 1000
+        onTriggered: {
+            toolbar.visible = true
+            toolbar.y = toolbar.shownY
+        }
+    }
+
     // 屏幕顶部 5px 热区 — 仅检测鼠标进入，不阻挡 RDP 交互
     MouseArea {
         id: topHotZone
@@ -109,9 +119,9 @@ Window {
         onContainsMouseChanged: {
             if (containsMouse) {
                 hideDelayTimer.stop()
-                toolbar.visible = true
-                toolbar.y = toolbar.shownY
+                showDelayTimer.restart()
             } else {
+                showDelayTimer.stop()
                 hideDelayTimer.restart()
             }
         }
@@ -295,7 +305,12 @@ Window {
                     label: usbManager.deviceLabel(i),
                     checked: usbManager.isDeviceSelected(i),
                     stateVal: usbManager.deviceState(i),
-                    errStr: usbManager.deviceError(i)
+                    errStr: usbManager.deviceError(i),
+                    // 已纳入磁盘重定向（走盘符进入虚拟机），置灰且不可勾选
+                    driveMapped: usbManager.isDiskRedirected(i),
+                    letters: usbManager.deviceDriveLetters(i),
+                    // 复合设备（含存储接口）：不置灰、保留 USB 选项，但需提示
+                    composite: usbManager.isStorageComposite(i)
                 })
             }
         }
@@ -424,7 +439,7 @@ Window {
                             delegate: Rectangle {
                                 width: usbListView.width
                                 height: 38
-                                color: itemMouse.containsMouse ? "#3a3a3a" : "transparent"
+                                color: (itemMouse.containsMouse && !model.driveMapped) ? "#3a3a3a" : "transparent"
                                 radius: 4
 
                                 Row {
@@ -434,20 +449,22 @@ Window {
                                     Rectangle {
                                         anchors.verticalCenter: parent.verticalCenter
                                         width: 18; height: 18; radius: 3
-                                        border.color: model.checked ? "#4CAF50" : "#888"
+                                        border.color: model.driveMapped ? "#555"
+                                                    : (model.checked ? "#4CAF50" : "#888")
                                         border.width: 1
-                                        color: model.checked ? "#4CAF50" : "transparent"
+                                        color: (model.checked && !model.driveMapped) ? "#4CAF50" : "transparent"
 
                                         Text {
                                             anchors.centerIn: parent
                                             text: "\u2713"
                                             color: "white"
                                             font.pixelSize: 11
-                                            visible: model.checked
+                                            visible: model.checked && !model.driveMapped
                                         }
 
                                         MouseArea {
                                             anchors.fill: parent
+                                            enabled: !model.driveMapped
                                             onClicked: {
                                                 var newVal = !model.checked
                                                 usbManager.setDeviceSelected(model.idx, newVal)
@@ -458,11 +475,33 @@ Window {
 
                                     Text {
                                         text: model.label
-                                        color: "#e0e0e0"
+                                        color: model.driveMapped ? "#6e6e6e" : "#e0e0e0"
                                         font.pixelSize: 12
                                         elide: Text.ElideRight
-                                        width: 280
+                                        width: model.driveMapped ? 150
+                                             : (model.composite ? 200 : 280)
                                         anchors.verticalCenter: parent.verticalCenter
+                                    }
+
+                                    // 复合设备（存储接口 + 其它接口）——保留 USB 透传选项，
+                                    // 但 VM 内可能与盘符重复出现，默认不勾选
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        visible: model.composite && !model.driveMapped
+                                        text: "\u26A0 含存储接口"
+                                        color: "#f0b429"
+                                        font.pixelSize: 10
+                                    }
+
+                                    // 已由磁盘重定向接管——标注对应盘符
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        visible: model.driveMapped
+                                        text: "\u21B3 " + model.letters
+                                        color: "#7aa2f7"
+                                        font.pixelSize: 11
+                                        elide: Text.ElideRight
+                                        width: 130
                                     }
 
                                     Text {
@@ -473,7 +512,7 @@ Window {
                                         color: model.stateVal === 2 ? "#4CAF50" :
                                                model.stateVal === 3 ? "#F44336" : "#999"
                                         font.pixelSize: 13
-                                        visible: model.stateVal !== 0
+                                        visible: model.stateVal !== 0 && !model.driveMapped
                                     }
                                 }
 
@@ -502,6 +541,9 @@ Window {
                                     anchors.fill: parent
                                     hoverEnabled: true
                                     onClicked: {
+                                        // 已由磁盘重定向接管——保留 USB 透传不可用
+                                        if (model.driveMapped)
+                                            return
                                         var newVal = !model.checked
                                         usbManager.setDeviceSelected(model.idx, newVal)
                                         model.checked = newVal

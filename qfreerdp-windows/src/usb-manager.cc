@@ -7,9 +7,13 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <winioctl.h>
 #include <setupapi.h>
+#include <cfgmgr32.h>
 #include <devpkey.h>
+#include <algorithm>
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 
 // Local DEVPROPKEY for BusReportedDeviceDesc.
 // Values from devpkey.h:
@@ -134,6 +138,171 @@ buildUsbNameMap_Win32()
 
     SetupDiDestroyDeviceInfoList(devInfo);
     return map;
+}
+
+// ── USB 设备 → 已挂载盘符 映射 ───────────────────────────────────────
+//
+// 返回：(VID << 16 | PID) → 该 USB 设备上已挂载卷的盘符列表（大写）。
+//
+// 只收录 FreeRDP rdpdr 客户端“确实会重定向”的卷，判据与官方
+// rdpdr_main.c 的 check_path() 保持一致：
+//   GetDriveType ∈ {FIXED, REMOVABLE, CDROM} 且 GetVolumeInformation 成功。
+// 因此：
+//   * 未格式化 / 加密锁定的卷 → 读不到卷信息 → 不在结果里，
+//     对应 USB 设备保留透传选项（不会被误置灰）；
+//   * 无盘符设备（MTP/PTP 手机、U 盾、加密狗、空读卡器）→ 不在结果里。
+// 网络盘（DRIVE_REMOTE）没有本地磁盘号，与 USB 设备无从关联，直接跳过。
+static std::map<uint32_t, std::vector<char>> buildUsbVolumeMap_Win32()
+{
+    std::map<uint32_t, std::vector<char>> result;
+
+    // {53f56307-b6bf-11d0-94f2-00a0c91efb8b} — GUID_DEVINTERFACE_DISK
+    static const GUID guidDevInterfaceDisk = {
+        0x53f56307, 0xb6bf, 0x11d0, { 0x94, 0xf2, 0x00, 0xa0, 0xc9, 0x1e, 0xfb, 0x8b }
+    };
+
+    // ── 1. 磁盘号 → (VID, PID)：沿 PnP 父设备链上溯到 USB 节点 ──
+    std::map<DWORD, uint32_t> diskToId;
+
+    HDEVINFO diskInfo = SetupDiGetClassDevsW(
+        &guidDevInterfaceDisk, nullptr, nullptr,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+
+    if (diskInfo != INVALID_HANDLE_VALUE)
+    {
+        SP_DEVICE_INTERFACE_DATA ifaceData;
+        ifaceData.cbSize = sizeof(ifaceData);
+
+        for (DWORD i = 0;
+             SetupDiEnumDeviceInterfaces(diskInfo, nullptr, &guidDevInterfaceDisk, i, &ifaceData);
+             i++)
+        {
+            DWORD needed = 0;
+            SetupDiGetDeviceInterfaceDetailW(diskInfo, &ifaceData, nullptr, 0, &needed, nullptr);
+            if (!needed)
+                continue;
+
+            std::vector<BYTE> buffer(needed);
+            auto* detail = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(buffer.data());
+            detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+            SP_DEVINFO_DATA devInfo;
+            devInfo.cbSize = sizeof(devInfo);
+            if (!SetupDiGetDeviceInterfaceDetailW(diskInfo, &ifaceData, detail, needed, nullptr,
+                                                  &devInfo))
+                continue;
+
+            // 打开磁盘接口取磁盘号（PartitionNumber == 0 表示整盘）
+            HANDLE hDisk = CreateFileW(detail->DevicePath, 0,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                       OPEN_EXISTING, 0, nullptr);
+            if (hDisk == INVALID_HANDLE_VALUE)
+                continue;
+
+            STORAGE_DEVICE_NUMBER sdn = {};
+            DWORD bytes = 0;
+            const BOOL ok = DeviceIoControl(hDisk, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0,
+                                            &sdn, sizeof(sdn), &bytes, nullptr);
+            CloseHandle(hDisk);
+            if (!ok)
+                continue;
+
+            // 从磁盘 PDO 沿父链上溯，第一个带 VID_/PID_ 的节点即 USB 设备
+            // （USBSTOR\Disk... 的父节点是 USB\VID_xxxx&PID_xxxx\...）
+            DEVINST devInst = devInfo.DevInst;
+            uint32_t vidpid = 0;
+            for (int depth = 0; depth < 8; depth++)
+            {
+                DEVINST parent = 0;
+                if (CM_Get_Parent(&parent, devInst, 0) != CR_SUCCESS)
+                    break;
+                devInst = parent;
+
+                WCHAR instanceId[MAX_DEVICE_ID_LEN] = {};
+                if (CM_Get_Device_IDW(devInst, instanceId, ARRAYSIZE(instanceId), 0) != CR_SUCCESS)
+                    break;
+
+                unsigned vid = 0, pid = 0;
+                const wchar_t* vp = wcsstr(instanceId, L"VID_");
+                const wchar_t* pp = wcsstr(instanceId, L"PID_");
+                if (vp && pp && swscanf_s(vp + 4, L"%x", &vid) >= 1 &&
+                    swscanf_s(pp + 4, L"%x", &pid) >= 1)
+                {
+                    vidpid = ((uint32_t)(uint16_t)vid << 16) | (uint16_t)pid;
+                    break;
+                }
+            }
+
+            if (vidpid)
+                diskToId[sdn.DeviceNumber] = vidpid;
+        }
+
+        SetupDiDestroyDeviceInfoList(diskInfo);
+    }
+
+    if (diskToId.empty())
+        return result;
+
+    // ── 2. 盘符 → 磁盘号 → (VID, PID) ──
+    const DWORD len = GetLogicalDriveStringsW(0, nullptr);
+    if (len == 0)
+        return result;
+
+    std::vector<WCHAR> roots(static_cast<size_t>(len) + 1, L'\0');
+    if (GetLogicalDriveStringsW(len + 1, roots.data()) == 0)
+        return result;
+
+    for (const WCHAR* root = roots.data(); *root; root += wcslen(root) + 1)
+    {
+        // 网络盘无本地磁盘号，与 USB 设备无关
+        if (GetDriveTypeW(root) == DRIVE_REMOTE)
+            continue;
+
+        WCHAR volumeName[MAX_PATH] = {};
+        if (!GetVolumeNameForVolumeMountPointW(root, volumeName, ARRAYSIZE(volumeName)))
+            continue;
+
+        // CreateFileW 不接受卷名的尾随反斜杠
+        std::wstring volumePath = volumeName;
+        if (!volumePath.empty() && volumePath.back() == L'\\')
+            volumePath.pop_back();
+
+        HANDLE hVol = CreateFileW(volumePath.c_str(), 0,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_EXISTING, 0, nullptr);
+        if (hVol == INVALID_HANDLE_VALUE)
+            continue;
+
+        STORAGE_DEVICE_NUMBER sdn = {};
+        DWORD bytes = 0;
+        const BOOL ok = DeviceIoControl(hVol, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0,
+                                        &sdn, sizeof(sdn), &bytes, nullptr);
+        CloseHandle(hVol);
+        if (!ok)
+            continue;
+
+        const auto it = diskToId.find(sdn.DeviceNumber);
+        if (it == diskToId.end())
+            continue; // 不是 USB 磁盘
+
+        // 官方 check_path() 要求能读到卷信息，否则不会重定向。
+        // 未格式化 / 加密锁定的卷在此被排除 → 保留 USB 透传选项。
+        if (!GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0))
+            continue;
+
+        char letter = static_cast<char>(root[0]);
+        if (letter >= 'a' && letter <= 'z')
+            letter = static_cast<char>(letter - 'a' + 'A');
+
+        auto& letters = result[it->second];
+        if (std::find(letters.begin(), letters.end(), letter) == letters.end())
+            letters.push_back(letter);
+    }
+
+    for (auto& entry : result)
+        std::sort(entry.second.begin(), entry.second.end());
+
+    return result;
 }
 
 } // anonymous namespace
@@ -271,9 +440,12 @@ void USBManager::onHotplugEvent()
 // Enumeration
 // ====================================================================
 
-bool USBManager::shouldShowDevice(const libusb_device_descriptor& desc,
-                                  libusb_device* dev) const
+bool USBManager::shouldShowDevice(const libusb_device_descriptor& desc, libusb_device* dev,
+                                  UsbInterfaceInfo* info) const
 {
+	if (info)
+		*info = UsbInterfaceInfo{};
+
 	// Always skip USB hubs
 	if (desc.bDeviceClass == 0x09)
 		return false;
@@ -282,31 +454,55 @@ bool USBManager::shouldShowDevice(const libusb_device_descriptor& desc,
 	if (desc.bDeviceClass == 0xE0)
 		return false;
 
-	// Skip audio devices (headsets, speakers, microphones)
-	if (desc.bDeviceClass == 0x01)
-		return false;
-
-	// Check interface descriptors for HID (keyboard, mouse, touchpad)
-	// and Audio (headsets, speakers)
 	libusb_config_descriptor* config = nullptr;
-	if (libusb_get_active_config_descriptor(dev, &config) == 0 && config)
+	if (libusb_get_active_config_descriptor(dev, &config) != 0 || !config)
 	{
-		for (int i = 0; i < static_cast<int>(config->bNumInterfaces); i++)
-		{
-			const auto* iface = &config->interface[i];
-			for (int j = 0; j < iface->num_altsetting; j++)
-			{
-				if (iface->altsetting[j].bInterfaceClass == 0x03 ||
-				    iface->altsetting[j].bInterfaceClass == 0x01)
-				{
-					// HID (keyboard/mouse/touchpad) or Audio (headset/speaker)
-					libusb_free_config_descriptor(config);
-					return false;
-				}
-			}
-		}
-		libusb_free_config_descriptor(config);
+		// 读不到接口描述符（权限/后端限制）时保守保留：宁可多显示一个，
+		// 也不要因为读不到描述符把加密狗这类设备整支漏掉。
+		// 同时标记为非纯存储，避免被磁盘重定向规则整体置灰。
+		if (info)
+			info->hasNonStorage = true;
+		return true;
 	}
+
+	size_t ifaceCount = 0;
+	bool allHidOrAudio = true;
+	bool hasStorage = false;
+	bool hasNonStorage = false;
+
+	for (int i = 0; i < static_cast<int>(config->bNumInterfaces); i++)
+	{
+		const auto* iface = &config->interface[i];
+		if (iface->num_altsetting <= 0)
+			continue;
+
+		// 只有第一个 altsetting 代表该接口的类别
+		const uint8_t cls = iface->altsetting[0].bInterfaceClass;
+		ifaceCount++;
+
+		if (cls == 0x08) // Mass Storage
+			hasStorage = true;
+		else
+			hasNonStorage = true;
+
+		// 只要出现 HID/Audio 之外的接口（如厂商自定义 0xFF），
+		// 就不能整支设备隐藏——带 HID 子接口的加密狗依赖这一点。
+		if (cls != 0x01 && cls != 0x03)
+			allHidOrAudio = false;
+	}
+
+	libusb_free_config_descriptor(config);
+
+	if (info)
+	{
+		info->hasStorage = hasStorage;
+		info->hasNonStorage = hasNonStorage;
+	}
+
+	// 仅当“所有接口都是 HID/Audio”时才隐藏：
+	// 键盘、鼠标、耳机等仍被过滤，带厂商自定义接口的设备保留。
+	if (ifaceCount > 0 && allHidOrAudio)
+		return false;
 
 	return true;
 }
@@ -338,7 +534,8 @@ void USBManager::enumerateInternal()
 		if (libusb_get_device_descriptor(dev, &desc) != 0)
 			continue;
 
-		if (!shouldShowDevice(desc, dev))
+		UsbInterfaceInfo ifInfo;
+		if (!shouldShowDevice(desc, dev, &ifInfo))
 			continue;
 
 		DeviceInfo info;
@@ -346,6 +543,7 @@ void USBManager::enumerateInternal()
 		info.pid = desc.idProduct;
 		info.bus = libusb_get_bus_number(dev);
 		info.addr = libusb_get_device_address(dev);
+		info.hasNonStorageInterface = ifInfo.hasNonStorage;
 
 #ifdef _WIN32
 		// Fast path: look up device name from the Windows PnP name map.
@@ -414,8 +612,166 @@ void USBManager::enumerateInternal()
 
 	libusb_free_device_list(list, 1);
 
+	// 重建“USB 设备 ↔ 盘符”映射：已纳入磁盘重定向的设备需置灰
+	applyDiskRedirectMap();
+
 	qf::log::info("usb/enum", "found {} USB device(s) after filtering",
 	              m_devices.size());
+}
+
+// ====================================================================
+// 磁盘重定向 (rdpdr drive) —— USB 设备 ↔ 盘符 映射
+// ====================================================================
+
+// 重建每个设备的 diskRedirected / driveLetters 状态。
+// 调用者必须已持有 m_mutex。
+void USBManager::applyDiskRedirectMap()
+{
+#ifdef _WIN32
+	const std::map<uint32_t, std::vector<char>> volumeMap = buildUsbVolumeMap_Win32();
+#else
+	const std::map<uint32_t, std::vector<char>> volumeMap;
+#endif
+
+	// 统计当前列表中同 VID/PID 的设备数量：>1 说明无法区分是哪一支
+	// （例如两支同型号 U 盘），此时一律保留 USB 透传选项。
+	std::map<uint32_t, int> idCount;
+	for (const auto& d : m_devices)
+		idCount[((uint32_t)d.vid << 16) | d.pid]++;
+
+	for (auto& d : m_devices)
+	{
+		d.diskRedirected = false;
+		d.driveLetters.clear();
+		d.storageComposite = false;
+
+		const uint32_t key = ((uint32_t)d.vid << 16) | d.pid;
+		const auto it = volumeMap.find(key);
+		if (it == volumeMap.end() || it->second.empty())
+			continue; // 无盘符 / 未格式化 / 加密盘 → 保留 USB 透传
+
+		// 复合设备（存储接口之外还有自定义/HID 等接口）不整体置灰：
+		// 只把“纯 U 盘/移动硬盘”交给磁盘重定向，其余一律保留 USB 透传选项。
+		// 注意 urbdrc 是整设备透传，两个选项同时生效时 VM 内可能出现两份，
+		// 因此 UI 会提示用户，且默认不勾选。
+		if (d.hasNonStorageInterface)
+		{
+			d.storageComposite = true;
+			qf::log::info("usb/disk-redirect",
+			              "{:04x}:{:04x} is a composite device (has non-storage "
+			              "interface), keeping USB passthrough",
+			              d.vid, d.pid);
+			continue;
+		}
+
+		if (idCount[key] > 1)
+		{
+			qf::log::warn("usb/disk-redirect",
+			              "{} USB device(s) share {:04x}:{:04x}, drive mapping is "
+			              "ambiguous, keeping USB passthrough",
+			              idCount[key], d.vid, d.pid);
+			continue;
+		}
+
+		std::string letters;
+		for (char letter : it->second)
+		{
+			// 通配模式：所有有盘符的卷都被重定向；
+			// 显式模式：只置灰确实列在 /drive: / drivestoredirect 中的盘符。
+			if (!m_diskRedirectWildcard && !m_redirectedLetters.contains(QChar::fromLatin1(letter)))
+				continue;
+			if (!letters.empty())
+				letters += ", ";
+			letters += letter;
+			letters += ':';
+		}
+		if (letters.empty())
+			continue;
+
+		d.diskRedirected = true;
+		d.driveLetters = letters;
+	}
+
+	// 已置灰的设备不能同时留在 USB 透传选中集合里
+	QVector<QPair<uint16_t, uint16_t>> stale;
+	for (const auto& key : m_selectedIds)
+	{
+		for (const auto& d : m_devices)
+		{
+			if (d.vid == key.first && d.pid == key.second && d.diskRedirected)
+			{
+				stale.append(key);
+				break;
+			}
+		}
+	}
+	for (const auto& key : stale)
+		m_selectedIds.remove(key);
+	for (auto& d : m_devices)
+	{
+		if (d.diskRedirected)
+			d.selected = false;
+	}
+}
+
+void USBManager::setDiskRedirectState(bool wildcard, const QSet<QChar>& letters)
+{
+	{
+		QMutexLocker lock(&m_mutex);
+		m_diskRedirectWildcard = wildcard;
+		m_redirectedLetters = letters;
+	}
+
+	qf::log::info("usb/disk-redirect",
+	              "state updated: wildcard={} explicitLetters={}",
+	              wildcard, static_cast<int>(letters.size()));
+
+	// 盘符探测涉及磁盘 I/O，放到后台线程，避免阻塞 RDP 连接建立
+	refreshDiskRedirectMap();
+}
+
+void USBManager::refreshDiskRedirectMap()
+{
+	if (m_volumeScanRunning.exchange(true, std::memory_order_acquire))
+		return; // 已有扫描在进行
+
+	std::thread([this]() {
+		{
+			QMutexLocker lock(&m_mutex);
+			applyDiskRedirectMap();
+		}
+		QMetaObject::invokeMethod(this, "onVolumeScanFinished", Qt::QueuedConnection);
+	}).detach();
+}
+
+void USBManager::onVolumeScanFinished()
+{
+	m_volumeScanRunning.store(false, std::memory_order_release);
+	emit deviceListChanged();
+}
+
+bool USBManager::isDiskRedirected(int index) const
+{
+	QMutexLocker lock(&m_mutex);
+	if (index < 0 || index >= static_cast<int>(m_devices.size()))
+		return false;
+	return m_devices[index].diskRedirected;
+}
+
+QString USBManager::deviceDriveLetters(int index) const
+{
+	QMutexLocker lock(&m_mutex);
+	if (index < 0 || index >= static_cast<int>(m_devices.size()))
+		return {};
+	return QString::fromStdString(m_devices[index].driveLetters);
+}
+
+bool USBManager::isStorageComposite(int index) const
+{
+	QMutexLocker lock(&m_mutex);
+	if (index < 0 || index >= static_cast<int>(m_devices.size()))
+		return false;
+	return m_devices[index].storageComposite;
 }
 
 void USBManager::enumerate()
@@ -528,6 +884,14 @@ void USBManager::setDeviceSelected(int index, bool selected)
 		return;
 
 	auto& d = m_devices[index];
+	// 已通过磁盘重定向进入 VM 的设备不能再走 USB 透传（互斥）
+	if (d.diskRedirected)
+	{
+		qf::log::warn("usb/select",
+		              "{:04x}:{:04x} is redirected as drive {}, USB passthrough is not allowed",
+		              d.vid, d.pid, d.driveLetters);
+		return;
+	}
 	d.selected = selected;
 	auto key = qMakePair(d.vid, d.pid);
 
@@ -564,14 +928,34 @@ int USBManager::selectedCount() const
 	return static_cast<int>(m_selectedIds.size());
 }
 
-std::vector<std::pair<uint16_t, uint16_t>> USBManager::selectedDeviceIds() const
+std::vector<USBManager::SelectedDevice> USBManager::selectedDevices() const
 {
 	QMutexLocker lock(&m_mutex);
-	std::vector<std::pair<uint16_t, uint16_t>> ids;
-	ids.reserve(m_selectedIds.size());
+	std::vector<SelectedDevice> out;
+	out.reserve(m_selectedIds.size());
+
 	for (const auto& key : m_selectedIds)
-		ids.emplace_back(key.first, key.second);
-	return ids;
+	{
+		SelectedDevice sd;
+		sd.vid = key.first;
+		sd.pid = key.second;
+
+		// bus/addr 用于“同型号多支”时改用 addr: 精确指定。
+		// 设备已从列表消失（例如已被重定向）时保持 0，调用方会退回 id:。
+		for (const auto& d : m_devices)
+		{
+			if (d.vid == key.first && d.pid == key.second)
+			{
+				sd.bus = d.bus;
+				sd.addr = d.addr;
+				break;
+			}
+		}
+
+		out.push_back(sd);
+	}
+
+	return out;
 }
 
 void USBManager::markRedirected(uint16_t vid, uint16_t pid, bool success,

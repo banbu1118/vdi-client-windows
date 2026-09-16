@@ -24,6 +24,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mmeapi.h>  // waveInGetNumDevs
+#include <dbt.h>     // WM_DEVICECHANGE / DBT_DEVICEARRIVAL
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -49,6 +50,8 @@
 #include <QBuffer>
 #include <QMimeData>
 #include <QTimer>
+#include <QAbstractNativeEventFilter>
+#include <QSet>
 #include <map>
 
 #include "qf_util.h"
@@ -86,6 +89,18 @@ static uint32_t g_cli_height = 0;
 static bool g_usb_cli_enabled = false; // 由 CLI（/usb:）或 .rdp 文件（usbdevicestoredirect）启用
 static std::string g_saved_usb_value;  // 保存的 USB 值，用于重连时恢复
 static std::vector<std::string> g_saved_drive_args;  // 保存的 /drive: 参数，用于重连时恢复
+
+/* 本次连接的磁盘重定向模式。
+ * 完全沿用服务端下发（/drives、/drive:name,path、.rdp 的 drivestoredirect），
+ * 客户端不自行开启磁盘重定向。用于 USB 列表的“已纳入磁盘重定向”置灰判断。 */
+enum class DriveRedirectMode
+{
+	None = 0,     /* 未启用磁盘重定向 */
+	Wildcard = 1, /* 重定向全部有盘符的卷（官方 {"drive","media","*"}） */
+	Explicit = 2  /* 只重定向显式列出的盘符 */
+};
+static DriveRedirectMode g_driveRedirectMode = DriveRedirectMode::None;
+static QSet<QChar> g_redirectedDriveLetters; /* Explicit 模式下被重定向的盘符 */
 static std::shared_ptr<qf::client_t> g_client = {};
 static std::unique_ptr<qf::clipboard_entry> g_clipboard_entry = nullptr;
 static std::unique_ptr<USBManager> g_usbManager;
@@ -1095,6 +1110,77 @@ static BOOL my_load_channels(freerdp* instance)
 	return TRUE;
 }
 
+// 判定本次连接的磁盘重定向模式（仅读服务端下发的配置），
+// 并同步给 USB 管理器，作为 USB 列表“已纳入磁盘重定向”置灰的依据。
+static void updateDriveRedirectState(rdpSettings* settings)
+{
+	const char* drivesToRedirect = freerdp_settings_get_string(settings, FreeRDP_DrivesToRedirect);
+	const bool redirectDrives = freerdp_settings_get_bool(settings, FreeRDP_RedirectDrives);
+
+	DriveRedirectMode mode = DriveRedirectMode::None;
+	QSet<QChar> letters;
+
+	if (drivesToRedirect && *drivesToRedirect)
+	{
+		if (strchr(drivesToRedirect, '*'))
+		{
+			mode = DriveRedirectMode::Wildcard;
+		}
+		else
+		{
+			/* drivestoredirect 形如 "C,D" / "C:,D:" / "label(C:\\)" */
+			mode = DriveRedirectMode::Explicit;
+			for (const char* p = drivesToRedirect; *p; p++)
+			{
+				const bool isLetter =
+				    (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z');
+				if (!isLetter)
+					continue;
+				if (p != drivesToRedirect && p[-1] != ',' && p[-1] != ';')
+					continue;
+				letters.insert(QChar::fromLatin1(*p).toUpper());
+			}
+		}
+	}
+	else if (redirectDrives)
+	{
+		/* /drives（不带值）→ 官方重定向全部有盘符的卷 */
+		mode = DriveRedirectMode::Wildcard;
+	}
+	else if (!g_saved_drive_args.empty())
+	{
+		/* /drive:name,path → 只重定向显式列出的路径 */
+		mode = DriveRedirectMode::Explicit;
+		for (const auto& arg : g_saved_drive_args)
+		{
+			const auto comma = arg.find(',');
+			const std::string path =
+			    (comma == std::string::npos) ? arg : arg.substr(comma + 1);
+			if (path.empty())
+				continue;
+			const QChar c = QChar::fromLatin1(path[0]).toUpper();
+			if (c.isLetter())
+				letters.insert(c);
+		}
+	}
+
+	g_driveRedirectMode = mode;
+	g_redirectedDriveLetters = letters;
+
+	qf::log::warn("rdp/disk-redirect",
+	              "mode={} letters={} drivestoredirect='{}' /drives={} /drive:={} ",
+	              mode == DriveRedirectMode::Wildcard  ? "wildcard"
+	              : mode == DriveRedirectMode::Explicit ? "explicit"
+	                                                    : "none",
+	              static_cast<int>(letters.size()),
+	              drivesToRedirect ? drivesToRedirect : "",
+	              redirectDrives ? "on" : "off",
+	              static_cast<int>(g_saved_drive_args.size()));
+
+	if (g_usbManager)
+		g_usbManager->setDiskRedirectState(mode == DriveRedirectMode::Wildcard, letters);
+}
+
 // 1. 预连接回调函数，在这里配置所有连接参数
 static BOOL my_pre_connect(freerdp* instance)
 {
@@ -1175,34 +1261,16 @@ static BOOL my_pre_connect(freerdp* instance)
 			}
 		}
 
-		// 处理 /drives 简写 — 枚举所有本地固定磁盘并添加到重定向列表
-		for (int i = 1; i < g_cli_argc; i++)
-		{
-			if (g_cli_argv[i] && strcmp(g_cli_argv[i], "/drives") == 0)
-			{
-				DWORD logicalDrives = GetLogicalDrives();
-				qf::log::warn("rdp/pre-connect",
-				              "/drives: enumerating local fixed drives (drives_bitmask=0x{:08x})",
-				              logicalDrives);
-				for (int d = 0; d < 26; d++)
-				{
-					if (logicalDrives & (1 << d))
-					{
-						char letter = 'A' + d;
-						char root[] = {letter, ':', '\\', '\0'};
-						if (GetDriveTypeA(root) == DRIVE_FIXED)
-						{
-							char arg[64] = {};
-							snprintf(arg, sizeof(arg), "%c,%c:\\", letter, letter);
-							g_saved_drive_args.push_back(arg);
-							qf::log::warn("rdp/pre-connect",
-							              "/drives: added {}", arg);
-						}
-					}
-				}
-				break;
-			}
-		}
+		// 磁盘重定向完全交给 FreeRDP 官方机制，这里不再做任何私有展开：
+		//   * 服务端下发 /drives        → 官方解析为 FreeRDP_RedirectDrives=TRUE
+		//   * 服务端下发 
+		//  → FreeRDP_DrivesToRedirect="*"
+		//   两者都会让 freerdp_client_load_addins() 加入 {"drive","media","*"}，
+		//   随后 rdpdr 的 first_hotplug() 在连接时枚举所有有盘符的卷
+		//   （DRIVE_FIXED|REMOVABLE|CDROM|REMOTE 且能读到卷信息，见 check_path()），
+		//   并由独立线程监听 WM_DEVICECHANGE 完成插拔热重定向。
+		// 旧实现只收 DRIVE_FIXED、是静态快照，且会与 first_hotplug() 对同一盘符
+		// 重复注册（同名同路径、automount 一真一假），已移除。
 
 		// FreeRDP 的 CLI 解析器处理 /clipboard:direction-to:* 和 /clipboard:files-to:*
 		// 等子选项时，只会更新 FreeRDP_ClipboardFeatureMask，但不会设置
@@ -1223,6 +1291,9 @@ static BOOL my_pre_connect(freerdp* instance)
 			}
 		}
 	}
+
+	// 同步本次连接的磁盘重定向状态给 USB 列表（每次连接/重连都执行）
+	updateDriveRedirectState(settings);
 
 	// ==== DEBUG: TCP resolve diagnostics ====
 	{
@@ -1405,22 +1476,65 @@ static BOOL my_pre_connect(freerdp* instance)
 	{
 		if (g_usbManager)
 		{
-			auto ids = g_usbManager->selectedDeviceIds();
-			if (!ids.empty())
+			auto devices = g_usbManager->selectedDevices();
+			if (!devices.empty())
 			{
-				qf::log::info("rdp/pre-connect",
-				              "toolbar has {} device(s) selected, adding via toolbar",
-				              ids.size());
-				for (const auto& [vid, pid] : ids)
+				// 同一 VID:PID 有多支（例如两支同型号 U 盘/加密狗）时，
+				// id: 无法区分是哪一支，整次连接改用 addr:bus:addr 精确指定。
+				// 注意 urbdrc 的 id:/addr: 是二选一（先看 id 列表，命中就返回），
+				// 因此不能只把其中一支换成 addr:，只能整体切换。
+				std::map<uint32_t, int> sameModel;
+				for (const auto& d : devices)
+					sameModel[((uint32_t)d.vid << 16) | d.pid]++;
+
+				bool needAddr = false;
+				for (const auto& d : devices)
 				{
-					char devId[32];
-					snprintf(devId, sizeof(devId), "id:%04x:%04x", vid, pid);
-					const char* usb_args[] = {URBDRC_CHANNEL_NAME, devId, nullptr};
-					if (!freerdp_client_add_dynamic_channel(settings, 2, usb_args))
-						qf::log::warn("rdp/pre-connect", "USB redirect failed for {}", devId);
-					else
-						qf::log::info("rdp/pre-connect", "USB redirect enabled for {}", devId);
+					if (sameModel[((uint32_t)d.vid << 16) | d.pid] > 1)
+						needAddr = true;
 				}
+
+				// addr 模式要求每支都能取到 bus/addr
+				bool addrUsable = needAddr;
+				if (needAddr)
+				{
+					for (const auto& d : devices)
+					{
+						if (d.bus == 0 || d.addr == 0)
+							addrUsable = false;
+					}
+				}
+				if (needAddr && !addrUsable)
+					qf::log::warn("rdp/pre-connect",
+					              "same-model USB devices detected but bus/addr unavailable, "
+					              "falling back to id:");
+
+				// 多个设备必须写在同一条参数里，用 '#' 分隔：
+				// urbdrc 对每个 id:/addr: 参数是直接赋值，多个参数只会保留最后一个。
+				std::string buf;
+				for (const auto& d : devices)
+				{
+					char one[32];
+					if (addrUsable)
+						snprintf(one, sizeof(one), "%02x:%02x", d.bus, d.addr);
+					else
+						snprintf(one, sizeof(one), "%04x:%04x", d.vid, d.pid);
+					if (!buf.empty())
+						buf += '#';
+					buf += one;
+				}
+				const std::string selector = (addrUsable ? "addr:" : "id:") + buf;
+
+				// freerdp_client_add_dynamic_channel() 对已存在的通道直接返回
+				// TRUE 且不追加参数，所以必须先把 CLI/.rdp 带来的旧参数删掉，
+				// 否则工具栏里的勾选根本不会生效。
+				freerdp_client_del_dynamic_channel(settings, URBDRC_CHANNEL_NAME);
+				const char* usb_args[] = {URBDRC_CHANNEL_NAME, selector.c_str(), nullptr};
+				if (!freerdp_client_add_dynamic_channel(settings, 2, usb_args))
+					qf::log::warn("rdp/pre-connect", "USB redirect failed for {}", selector);
+				else
+					qf::log::info("rdp/pre-connect", "USB redirect enabled for {} device(s): {}",
+					              devices.size(), selector);
 			}
 			else
 			{
@@ -1908,6 +2022,60 @@ void start_rdp_connection()
 	});
 }
 
+/* =====================================================================
+ * WM_DEVICECHANGE 监听 —— USB 插拔/盘符变化时自动刷新
+ *
+ * 背景：libusb 的 hotplug 注册在 Windows 上返回 LIBUSB_ERROR_NOT_SUPPORTED
+ * （FreeRDP 自己的 urbdrc 也会打印 "Platform does not support libusb hotplug"），
+ * 所以插上设备后列表不会自动更新。这里改用 Win32 的 WM_DEVICECHANGE
+ * （DBT_DEVNODES_CHANGED 会广播给所有顶层窗口，无需注册）作为触发源：
+ *   1) 重新枚举 USB 列表（顺带重建“已磁盘重定向”的置灰/盘符标注）
+ *   2) 重新扫描卷，让盘符映射跟随插拔变化
+ * 与 rdpdr 官方热插拔线程相互独立，本过滤器不拦截消息。
+ * ===================================================================== */
+class VolumeChangeFilter : public QAbstractNativeEventFilter
+{
+public:
+	VolumeChangeFilter()
+	{
+		// 一次插拔会连发多条 WM_DEVICECHANGE，去抖后再统一刷新，避免重复枚举
+		m_timer.setSingleShot(true);
+		m_timer.setInterval(400);
+		QObject::connect(&m_timer, &QTimer::timeout, []() {
+			if (!g_usbManager)
+				return;
+			g_usbManager->enumerate(); // 内部已重建盘符映射并 emit deviceListChanged
+			g_usbManager->refreshDiskRedirectMap(); // 兜底：枚举被去重跳过时也能刷新
+		});
+	}
+
+	bool nativeEventFilter(const QByteArray& eventType, void* message, qintptr* result) override
+	{
+		if (eventType != "windows_generic_MSG")
+			return false;
+
+		const auto* msg = static_cast<MSG*>(message);
+		if (msg->message != WM_DEVICECHANGE)
+			return false;
+
+		switch (msg->wParam)
+		{
+			case DBT_DEVICEARRIVAL:
+			case DBT_DEVICEREMOVECOMPLETE:
+			case DBT_DEVNODES_CHANGED:
+				m_timer.start(); // 重新计时（去抖）
+				break;
+			default:
+				break;
+		}
+
+		return false; /* 不拦截，消息继续正常分发 */
+	}
+
+private:
+	QTimer m_timer;
+};
+
 int main(int argc, char* argv[])
 {
 	// 自动设置 OpenSSL 环境变量，确保 legacy.dll 和 openssl.cnf 被正确加载
@@ -1948,10 +2116,14 @@ int main(int argc, char* argv[])
 
 	qf::log::init();
 
-	// Disable Qt Quick pipeline cache to avoid creating %LOCALAPPDATA%\qf-client\cache\
+	// Disable Qt Quick pipeline cache to avoid creating %LOCALAPPDATA%/qf-client/cache
 	qputenv("QSG_PIPELINE_CACHE", "0");
 
 	QGuiApplication app(argc, argv);
+
+	// 盘符插入/拔出时即时刷新 USB 列表的置灰状态
+	static VolumeChangeFilter volumeChangeFilter;
+	app.installNativeEventFilter(&volumeChangeFilter);
 
 	// Set application window icon (from qrc resources.qrc)
 	QIcon appIcon(QStringLiteral(":/app.ico"));

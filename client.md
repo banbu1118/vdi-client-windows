@@ -56,6 +56,18 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
 - 为 qfreerdp 提供完整 RDP 客户端能力：连接建立（NLA/证书）、图形编码（GFX/H264/AVC444）、虚拟通道（cliprdr、disp、rdpsnd、audin、urbdrc、rdpecam）、GDI 绘制、指针/光标支持等。
 - qfreerdp 的 `CMakeLists.txt` 通过 `find_package(FreeRDP 3 / WinPR 3 / FreeRDP-Client 3)` 引用其 `install` 目录，链接 `freerdp`、`freerdp-client`、`winpr` 三个库。
 
+### 2.5 本地补丁（相对上游 3.28.0）
+
+**当前 `freerdp-3.28.0/` 已非上游原样，`libfreerdp/common/settings.c` 有一处必要补丁；若重新解压源码包，该补丁会丢失，需重新应用并重新编译。**
+
+- **位置**：`libfreerdp/common/settings.c` 的 `freerdp_addin_argv_new()`。
+- **问题**：该函数对参数数组逐项执行 `_strdup()`，任一元素为 `NULL` 即 `goto fail` 并返回 `NULL`。而 `RDPDR_DRIVE` 的 `automount` 语义恰恰是"第 3 个参数为 `nullptr`"——同文件 `freerdp_device_new()` 中 `if (count > 2) device->u.drive.automount = (args[2] == nullptr);`。WinPR 的 `_strdup(NULL)` 返回 `NULL`，于是整张参数表构造失败。
+- **后果**：`rdpdr` 通道的热插拔装载路径 `first_hotplug()` → `rdpdr_load_drive(rdpdr, name, path, TRUE)` 中，`freerdp_device_new()` 返回 `NULL`，`rdpdr_load_drive()` 走 `if (!drive.device) goto fail;` **静默返回 `FALSE`（无任何日志）**，磁盘重定向整体失效。仅影响通配路径（`/drives`、`drivestoredirect:*`、`+drives`）；显式 `/drive:name,path` 因 `automount=FALSE`、第 3 个参数非空而不受影响——这也是"mstsc 能重定向、客户端 `+drives` 不行"的原因。
+- **补丁**：在参数循环中跳过 `NULL` 元素（`calloc` 已把该槽位置零，语义不变），仅增加两行：
+  - `if (!argv[x]) continue;`
+- **验证**：打补丁后客户端日志出现 `Loading device service drive [C] (static)`、`registered [    drive] device #1:     C`、`send [PAKID_CORE_DEVICELIST_ANNOUNCE] [2]`，服务端回 `PAKID_CORE_DEVICE_REPLY ... status=0x00000000`。
+- **注意**：补丁落在 `libfreerdp`，编译产物是 **`freerdp3.dll`**（不是 `freerdp-client3.dll`），部署与打包时必须一并更新。
+
 ---
 
 ## 三、qfreerdp-windows（RDP 渲染客户端，qf-client.exe）
@@ -74,9 +86,9 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
 ### 3.3 源码构成（src/）
 | 文件 | 职责 |
 |---|---|
-| `mini-qf-client.cc` | 核心连接引擎：`PreConnect`/`PostConnect`/`LoadChannels` 回调、独立 RDP 线程的事件循环、连接重试（3 次）、断线重连状态机、剪贴板（cliprdr）回调实现、GFX/disp 动态通道管理、命令行解析、OpenSSL 环境变量设置、分辨率计算 |
+| `mini-qf-client.cc` | 核心连接引擎：`PreConnect`/`PostConnect`/`LoadChannels` 回调、独立 RDP 线程的事件循环、连接重试（3 次）、断线重连状态机、剪贴板（cliprdr）回调实现、GFX/disp 动态通道管理、命令行解析、OpenSSL 环境变量设置、分辨率计算；磁盘重定向模式判定（`updateDriveRedirectState()`）；USB 重定向参数构造（`id:` / `addr:` 单参数 `#` 分隔，见 3.7）；`WM_DEVICECHANGE` 去抖监听（插拔后自动刷新 USB 列表，见 3.7） |
 | `rdp-view-item.h` | `RdpViewItem`（QQuickItem）：**D3D11 原生纹理渲染管线**（`RdpFrameTexture` + QRhi）、鼠标/滚轮/键盘事件转发、光标显示/隐藏、剪贴板数据转换（文本/图片/文件） |
-| `usb-manager.cc/.h` | 基于 libusb 的 USB 设备枚举与热插拔监听、设备选择状态管理，USB 重定向触发重连 |
+| `usb-manager.cc/.h` | 基于 libusb 的 USB 设备枚举、选择状态管理与重定向触发重连；设备过滤规则（仅"全部接口都是 HID/Audio"才隐藏，见 3.7）；"USB 设备 ↔ 盘符"映射（SetupAPI 卷/磁盘类设备枚举 + `CM_Get_Parent` 回溯父设备链取 VID/PID）与"已磁盘重定向"置灰状态；复合设备（存储接口 + 其它接口）判定 |
 | `clipboard-entry.h` | 远程文件剪贴板：解析 `FileGroupDescriptorW`，通过 `FILECONTENTS_SIZE/RANGE` 分块下载远程文件到本地临时目录 |
 | `qf_channel_client_handler.c` | 剪贴板通道 addin 的 handler（`cliprdr_VirtualChannelEntryEx`） |
 | `ref-tmp/` | 从 FreeRDP 源码拷贝的 cliprdr 相关源文件（编译时用 `/FORCE:MULTIPLE` 容忍重复符号） |
@@ -88,9 +100,9 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
 - **全屏 RDP 渲染**：FreeRDP 线程解码帧写入 GDI buffer → 脏矩形拷贝到 CPU staging buffer → GUI 线程触发 `update()` → `beforeRendering` 中通过 `ID3D11DeviceContext::UpdateSubresource` 零拷贝上传到 D3D11 纹理 → QSGSimpleTextureNode 渲染。
 - **动态分辨率**：基于窗口实际物理尺寸（考虑 HiDPI 的 devicePixelRatio，按 4 对齐）通过 disp 通道 `SendMonitorLayout` 下发，并跟踪 GFX_RESET 结果；连接前也设置 monitor layout 与 DesktopWidth/Height。
 - **剪贴板双向**：文本（CF_UNICODETEXT）、图片（CF_DIB/DIBV5/PNG）、文件（FileGroupDescriptorW 双向传输）。
-- **USB 重定向**：工具栏 USB 弹窗选择设备（libusb 枚举，热插拔），选择确认后通过 `urbdrc` 动态通道以 `id:VID:PID` 重定向，并自动重连。
+- **USB 重定向**：工具栏 USB 弹窗选择设备（libusb 枚举 + `WM_DEVICECHANGE` 插拔自动刷新），确认后通过 `urbdrc` 动态通道重定向并自动重连；默认发 `id:VID:PID`，检测到同型号多支时整次连接改为 `addr:bus:addr`（详见 3.7）。已被磁盘重定向接管的存储类设备在列表中**置灰并标注盘符**、不可勾选；复合设备（存储接口之外还有自定义接口）**不整体置灰**，仅标注提示（详见 3.6.2、3.7）。
 - **摄像头/麦克风重定向**：rdpecam（WMF 后端，`device:*`）、audin（WinMM，检测到麦克风才启用）。
-- **磁盘重定向**：支持 `/drive:name,path` 与 `/drives`（枚举全部固定盘）。
+- **磁盘重定向**：支持 `/drive:name,path`（显式路径）与 `/drives`（通配，重定向本机**所有**有盘符的卷：系统盘、内置固定盘、U 盘、移动硬盘、网络盘，不做收敛）；与 USB 透传互斥，详见 3.6。
 - **连接参数**：兼容 FreeRDP 命令行（`/v:`、`/u:`、`/p:`、`/cert:ignore`、`/f`、`/clipboard:`、`/usb:`、`/drive:`），也支持 `.rdp` 文件；忽略 `.rdp` 内分辨率、强制使用窗口/屏幕尺寸。
 - **稳定性**：TCP 连接超时 15s、瞬态失败自动重试 3 次、USB 变化自动重连、证书忽略验证、GFX 开启（H264 + AVC444/444v2、ThinClient）。
 
@@ -147,7 +159,97 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
 | `Win+Tab` / `Win+方向键` | 由 DWM 在系统层处理，用户态钩子无法可靠拦截 |
 | `Alt+Esc` | 系统保留的 shell 窗口循环组合，未拦截，本地生效 |
 
-### 3.6 构建与部署（build-qf-client.ps1）
+### 3.6 磁盘重定向（`/drives` 通配）与 USB 互斥
+
+**背景**：部分 U 盘（尤其固态 U 盘）走 `urbdrc` USB 透传时在 Win10 虚拟机内无法识别，而磁盘重定向（rdpdr + `drive` 设备服务）走的是另一条更稳定的通道。因此策略是——**只要本次连接启用了磁盘重定向，就把本机全部有盘符的卷都通过磁盘重定向送进 VM；已被磁盘重定向的存储设备不再出现在 USB 透传列表里**。
+
+#### 3.6.1 重定向全走 FreeRDP 官方机制
+
+qf-client **不再做任何私有展开**，只依赖官方链路：
+
+| 服务端下发 | FreeRDP 解析结果 | 后续行为 |
+|---|---|---|
+| `/drives` | `FreeRDP_RedirectDrives=TRUE` | `freerdp_client_load_addins()` 加入设备 `{"drive","media","*"}` |
+| `drivestoredirect:s:*` / `*` | `FreeRDP_DrivesToRedirect="*"` | 同上 |
+| `/drive:name,path` | 显式设备（`Path` 为具体路径） | 只重定向该路径，不触发通配枚举 |
+
+连接时 `rdpdr` 通道 `rdpdr_add_devices()` 遇到 `Path == "*"` 即调用 `first_hotplug()`：
+
+1. `GetLogicalDrives()` 取本机盘符位图，逐盘调用 `check_path()` 过滤，条件为
+   `GetDriveTypeA ∈ {DRIVE_FIXED, DRIVE_REMOVABLE, DRIVE_CDROM, DRIVE_REMOTE}` 且 `GetVolumeInformationA` 成功。
+   - **不做收敛**：系统盘、内置固定盘、U 盘 2.0/3.0、固态 U 盘、移动硬盘、网络盘一并纳入（例如实测枚举到 `C:\`(type=3)、`Z:\`(type=4 网络盘)）。
+   - 未格式化卷、`D:\`(光驱无盘, type=5) 等被自然排除。
+2. 每个通过的盘调用 `rdpdr_load_drive(rdpdr, name, path, TRUE)`（`automount=TRUE`）→ `devman_load_device_service()` 装载 `drive` 设备服务。
+3. `first_hotplug()` 执行时通道仍在 `RDPDR_CHANNEL_STATE_INITIAL`，设备先注册进 devman 缓存；待协商到 `READY` 并收到 `PAKID_CORE_USER_LOGGEDON` 后，统一以 `PAKID_CORE_DEVICELIST_ANNOUNCE` 公告，服务端逐个回 `PAKID_CORE_DEVICE_REPLY status=0`。
+4. 连接后由 rdpdr 官方热插拔线程监听 `WM_DEVICECHANGE`（`DBT_DEVICEARRIVAL` / `DBT_DEVICEREMOVECOMPLETE`）完成插入自动出现盘符、拔出自动消失。
+
+> **前置依赖**：该通配路径依赖 §2.5 的 FreeRDP 本地补丁，否则 `first_hotplug()` 枚举通过后 `rdpdr_load_drive()` 会静默失败，VM 内不会有任何盘符。
+
+**已移除的旧实现**：旧版 qf-client 自己解析 `/drives` 并展开成若干 `/drive:` 私有参数，只收 `DRIVE_FIXED`、是静态快照（插入/拔出不生效），且会与官方 `first_hotplug()` 对同一盘符重复注册（同名同路径、`automount` 一真一假）。现已整体删除。
+
+#### 3.6.2 与 USB 的互斥（列表置灰）
+
+- **模式判定**：`updateDriveRedirectState()` 在每次连接/重连的 `PreConnect` 中读取服务端下发的配置，得到 `DriveRedirectMode` 与被重定向盘符集合：
+
+  | 判定依据 | 模式 | 含义 |
+  |---|---|---|
+  | `DrivesToRedirect` 含 `*` | `Wildcard` | 所有有盘符的卷都已重定向 |
+  | `DrivesToRedirect` 形如 `C,D` / `C:,D:` / `label(C:\)` | `Explicit` | 仅解析出的盘符被重定向 |
+  | `RedirectDrives = TRUE`（即 `/drives`） | `Wildcard` | 同上 |
+  | 仅 `/drive:name,path` | `Explicit` | 取 path 首字符作为盘符 |
+
+- **状态下发**：结果通过 `USBManager::setDiskRedirectState(wildcard, letters)` 同步给 USB 管理器。
+- **盘符映射**：USB 侧用 SetupAPI 枚举**卷设备** → 关联**磁盘设备** → `CM_Get_Parent()` 回溯父设备链取 USB 设备的 VID/PID，把"盘符 → VID:PID"落到 `DeviceInfo::diskRedirected` / `driveLetters`。
+- **置灰规则**：`Wildcard` 下所有"已挂载卷"的 USB 存储设备置灰；`Explicit` 下仅命中盘符的置灰。置灰项**不可勾选**，也没有"改用 USB 透传"的逃生开关；但**映射失败或判断不出来的一律保留 USB 选项**——MTP/PTP、加密狗、U 盾等无盘符设备继续走 USB 透传，USB 列表不因本方案而收缩。**额外的置灰例外**：设备除存储接口外还存在其它接口（自定义 0xFF / HID / Audio 等）时，视为复合设备，**不整体置灰**，保留 USB 勾选项（见 3.7.3）。
+- **实时刷新**：`VolumeChangeFilter`（`QAbstractNativeEventFilter`）监听 `WM_DEVICECHANGE` 的 `DBT_DEVICEARRIVAL` / `DBT_DEVICEREMOVECOMPLETE` / `DBT_DEVNODES_CHANGED`，**去抖 400 ms** 后触发 `USBManager::enumerate()`（重跑 libusb 枚举，其内部会重建"USB ↔ 盘符"映射并 `emit deviceListChanged`），再补一次 `refreshDiskRedirectMap()` 兜底。此过滤器与 rdpdr 官方热插拔线程相互独立：官方线程负责把盘符送进 VM，此处负责让 USB 弹窗的列表与标注实时跟随（详见 3.7.4）。
+- **UI**：`main.qml` 通过 `usbManager.isDiskRedirected(i)` / `usbManager.deviceDriveLetters(i)` 渲染置灰与盘符标注（如 `E:, F:`），通过 `usbManager.isStorageComposite(i)` 渲染复合设备提示 `⚠ 含存储接口`。
+
+#### 3.6.3 验收要点
+
+1. 固态 U 盘插入后 VM 内自动出现盘符并可读写；
+2. 拔出后 VM 内盘符消失；
+3. 同一个盘不会同时以"USB 设备 + 盘符"两种形态出现（**例外**：复合设备按 3.7.3 保留 USB 勾选项，若用户两边都选则可能出现两份，属预期行为）；
+4. 未格式化/加密盘、手机等无盘符设备仍能在 USB 列表里选到。
+
+### 3.7 USB 透传（urbdrc）：过滤、选择与插拔刷新
+
+#### 3.7.1 设备过滤规则（`shouldShowDevice()`）
+
+`bDeviceClass == 0x09`（Hub）与 `0xE0`（无线/蓝牙控制器）直接隐藏；其余按**接口类别**判定——遍历当前配置的每个接口（取首个 altsetting 的 `bInterfaceClass`），**仅当所有接口都属于 HID(0x03) / Audio(0x01) 时才隐藏**。只要出现其它类别（含厂商自定义 0xFF、Mass Storage 0x08）就保留。读不到接口描述符（权限/后端限制）时保守保留，避免漏掉设备。
+
+- 效果：键盘、鼠标、耳机仍被隐藏；**带 HID 子接口的加密狗能出现在列表里**。
+- 副作用：带厂商接口的游戏鼠标/宏键盘也会出现——仅凭类码无法把它们与"狗"区分开。
+- 同时把"是否存在非存储接口"记入 `DeviceInfo::hasNonStorageInterface`，供 3.7.3 的置灰例外使用（libusb 描述符已在手，无额外开销）。
+
+#### 3.7.2 选择语法（`id:` 与 `addr:`）
+
+FreeRDP 官方语法（`client/common/cmdline.h`）：`/usb:[dbg,][id:<vid>:<pid>#...,][addr:<bus>:<addr>#...,][auto]`。
+
+- **默认 `id:VID:PID`**；同一 VID:PID 出现多支时无法区分，此时**整次连接**改用 `addr:bus:addr`（十六进制，取自 `libusb_get_bus_number()` / `libusb_get_device_address()`，经 `USBManager::selectedDevices()` 带出）；取不到 bus/addr 时回退 `id:` 并告警。
+- 两条硬约束（源自 urbdrc 实现 `channels/urbdrc/client/libusb/libusb_udevman.c`）：
+  1. **`id:` 与 `addr:` 二选一**——`udevman_listener_created_callback()` 先看 `devices_vid_pid`，命中即 `return`，`devices_addr` 永不生效。所以不能"只对其中一支切换模式"，只能整体切换。
+  2. **多个设备必须写进同一条参数、用 `#` 分隔**——解析时对 `devices_vid_pid` / `devices_addr` 是直接赋值，写多个同类参数只会保留最后一个。
+- **`serial:` 上游不支持**：urdrc 只解析 `id` / `addr` / `dev` / `device` / `auto` / `dbg` / `sys`，没有序列号分支。
+- `addr:` 是**动态**的：重插或换 USB 口后 bus/addr 会变，需重新选择；配合 3.7.4 的自动刷新与重连兜底。
+
+#### 3.7.3 与磁盘重定向的互斥（含复合设备例外）
+
+置灰与盘符标注的判定见 3.6.2。补充要点：设备**除存储接口外还存在其它接口**（自定义 0xFF / HID / Audio 等）时视为复合设备，**不整体置灰**、保留 USB 勾选项，UI 标注 `⚠ 含存储接口`。注意 urbdrc 是**整设备**透传、不做接口级切分，所以复合设备若两个选项同时生效，VM 内可能同时出现 USB 设备与盘符（因此默认不勾选，由用户显式决定）。
+
+#### 3.7.4 插拔自动刷新（替代失效的 libusb hotplug）
+
+`libusb_hotplug_register_callback()` 在 Windows 上实测返回 `LIBUSB_ERROR_NOT_SUPPORTED`（FreeRDP 的 urbdrc 同样打印 `Platform does not support libusb hotplug`），因此插上设备后列表不会自动更新。改以 Win32 `WM_DEVICECHANGE` 为触发源：`DBT_DEVNODES_CHANGED` 会广播给所有顶层窗口，**无需 `RegisterDeviceNotification`**；`VolumeChangeFilter`（`QAbstractNativeEventFilter`）收到后**去抖 400 ms**，再调用 `USBManager::enumerate()`（内部重建"USB ↔ 盘符"映射并 `emit deviceListChanged`）与 `refreshDiskRedirectMap()`。`enumerate()` 本身已是"后台线程 + `m_enumRunning` 去重"，不会阻塞 QML 线程。
+
+#### 3.7.5 通道参数的写入方式（易踩坑）
+
+`freerdp_client_add_dynamic_channel()` 对**已存在**的通道直接返回 `TRUE` 且不追加任何参数（`client/common/cmdline.c`）。而工具栏要修改的恰恰是 CLI / `.rdp` 已注册的 `urbdrc` 通道，因此 `PreConnect` 中必须**先 `freerdp_client_del_dynamic_channel(settings, URBDRC_CHANNEL_NAME)` 再重新添加**，否则勾选不会生效。未勾选任何设备时不改动通道，沿用 CLI / `.rdp` 的原始参数。
+
+#### 3.7.6 前置依赖
+
+- **UsbDk 必须安装**（`libusb_set_option(LIBUSB_OPTION_USE_USBDK)`；安装包内置 `UsbDk_1.0.22_x64.msi`），否则设备枚举/占用可能失败。
+- 加密狗常被厂商驱动独占，透传前可能需要在**本机**停掉厂商服务。
+
+### 3.8 构建与部署（build-qf-client.ps1）
 1. 依赖校验：FreeRDP install 目录、vcpkg toolchain、Qt 6.11.1、VS2022。
 2. CMake + Ninja + MSVC 编译出 `qf-client.exe`。
 3. 部署运行时到 build 目录：
@@ -156,7 +258,7 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
    - FFmpeg（avcodec/avformat/avutil 等）、OpenH264、libx264、zlib；
    - Qt 核心/Quick/Controls 相关 DLL、`platforms/qwindows.dll`、imageformats、iconengines、QML 模块（QtQml/QtQuick/...）、MSVC 运行时（VC143 CRT）。
 
-### 3.7 运行示例
+### 3.9 运行示例
 ```
 qf-client.exe /v:192.168.1.90 /u:administrator /p:123456 /cert:ignore /f
 ```
@@ -166,7 +268,7 @@ qf-client.exe /v:192.168.1.90 /u:administrator /p:123456 /cert:ignore /f
 ## 四、vdi-client-windows-main（VDI 管理客户端，VDIClient.exe）
 
 ### 4.1 项目性质
-- 基于 **Qt 6（Widgets + Network）** 的 VDI 管理客户端，版本 **1.5.0**（CMake 中 `project(VDIClient VERSION 1.5.0)`）。
+- 基于 **Qt 6（Widgets + Network）** 的 VDI 管理客户端，版本 **1.6.0**（CMake 中 `project(VDIClient VERSION 1.6.0)`，安装包版本同步见 `installer.iss` 的 `MyAppVersion`）。
 - 语言标准：**C++17**，构建工具 CMake（仓库内 `build/` 为 MSVC 的 VS 工程产物，含 `VDIClient.sln`）。
 - 功能定位：登录 → 虚拟机列表管理 → 拉起 RDP 客户端（qf-client.exe）完成远程连接。
 
@@ -204,7 +306,8 @@ qf-client.exe /v:192.168.1.90 /u:administrator /p:123456 /cert:ignore /f
 1. **RDP 渲染链路（qf-client）**：FreeRDP GDI buffer → CPU staging buffer（脏矩形）→ D3D11 纹理（`UpdateSubresource` 零拷贝）→ Qt 场景图。渲染与 RDP 线程分离，通过 `QMetaObject::invokeMethod(QueuedConnection)` 做线程切换。
 2. **动态分辨率**：disp 通道 `SendMonitorLayout` + GFX 图形管道（H264/AVC444）协同，带 300ms 防抖与 GFX_RESET 一致性跟踪。
 3. **剪贴板文件传输**：自实现 FileGroupDescriptorW 解析/序列化，远端→本地按 64KB 分块下载，含路径安全校验（拒绝绝对路径与 `..`）。
-4. **USB 重定向**：libusb 枚举 + 热插拔回调 → urbdrc 通道 `id:vid:pid` → 触发 RDP 自动重连。
-5. **多进程协作**：VDIClient.exe（管理面）与 qf-client.exe（数据面）解耦，通过 QProcess + 命令行参数（含 .rdp 文件）协作。
-6. **构建链**：vcpkg（依赖）→ FreeRDP（build-freerdp.ps1）→ qf-client（build-qf-client.ps1）→ VDIClient（CMake 拷贝 bin/ 打包）。
-7. **系统快捷键拦截（qf-client）**：`WH_KEYBOARD_LL` 低级键盘钩子仅在客户端窗口前台时启用，本地吞掉 Win/Win+字母/Alt+Tab/PrintScreen 及被本地热键抢占的 Ctrl+Space/Ctrl+Shift+Esc/Ctrl+Esc 并转发到 RDP 会话（详见 3.5）；`Win+L` 与 `Ctrl+Alt+Del` 属系统安全边界，用户态无法拦截——Win+L 锁本地机器（同 mstsc），Ctrl+Alt+Del 由工具栏按钮发送。键盘事件转发采用"映射表优先、盲区回退物理扫描码"策略，保证 Delete/方向键等扩展键的 RDP 扩展位正确。
+4. **USB 重定向**：libusb 枚举 → 过滤（仅"全部接口都是 HID/Audio"才隐藏，故带 HID 子接口的加密狗可见）→ 工具栏勾选 → urbdrc 动态通道（默认 `id:VID:PID`，同型号多支时整体切 `addr:bus:addr`；多设备写在**同一条**参数里用 `#` 分隔）→ 触发 RDP 自动重连。插拔刷新改由 `WM_DEVICECHANGE` 去抖触发（libusb hotplug 在 Windows 上不可用）。改动通道参数前必须先 `freerdp_client_del_dynamic_channel()`，否则对已存在的通道添加参数是空操作（详见 §3.7）。
+5. **磁盘重定向（/drives）**：全走 FreeRDP 官方机制——`/drives` → `FreeRDP_RedirectDrives=TRUE` → 设备 `{"drive","media","*"}` → rdpdr `first_hotplug()` 枚举所有有盘符的卷（`check_path()` 过滤 FIXED/REMOVABLE/CDROM/REMOTE）→ `rdpdr_load_drive(automount=TRUE)` → 通道 READY + `USER_LOGGEDON` 后统一 `DEVICELIST_ANNOUNCE`；插拔由 rdpdr 官方 `WM_DEVICECHANGE` 线程热重定向（详见 §3.6）。**与 USB 互斥**：已纳入磁盘重定向的 USB 存储设备在 USB 列表置灰并标注盘符、禁止勾选；无盘符设备（U 盾/加密狗/MTP）仍走 USB 透传；**复合设备（存储接口之外还有自定义/HID 接口）不整体置灰**，保留勾选项并标注 `⚠ 含存储接口`。
+6. **多进程协作**：VDIClient.exe（管理面）与 qf-client.exe（数据面）解耦，通过 QProcess + 命令行参数（含 .rdp 文件）协作。
+7. **构建链**：vcpkg（依赖）→ FreeRDP（build-freerdp.ps1，**含 §2.5 本地补丁**）→ qf-client（build-qf-client.ps1）→ VDIClient（CMake 拷贝 bin/ 打包）。改 FreeRDP 源码后必须重编并同步 `freerdp3.dll` / `freerdp-client3.dll` / `winpr3.dll`，否则包里的客户端仍带旧库。
+8. **系统快捷键拦截（qf-client）**：`WH_KEYBOARD_LL` 低级键盘钩子仅在客户端窗口前台时启用，本地吞掉 Win/Win+字母/Alt+Tab/PrintScreen 及被本地热键抢占的 Ctrl+Space/Ctrl+Shift+Esc/Ctrl+Esc 并转发到 RDP 会话（详见 3.5）；`Win+L` 与 `Ctrl+Alt+Del` 属系统安全边界，用户态无法拦截——Win+L 锁本地机器（同 mstsc），Ctrl+Alt+Del 由工具栏按钮发送。键盘事件转发采用"映射表优先、盲区回退物理扫描码"策略，保证 Delete/方向键等扩展键的 RDP 扩展位正确。
