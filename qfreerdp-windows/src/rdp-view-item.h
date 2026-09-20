@@ -1029,13 +1029,27 @@ public:
                           freerdp_mouse_event, map_x, map_y);
     }
 
+    /* Qt 按键 → RDP 按键位映射。RDP 侧三个键位互不相同，必须逐一对应：
+     * BUTTON1=左键、BUTTON2=右键、BUTTON3=中键。若像以前那样"非左键即 BUTTON2"，
+     * 中键会被远端当右键处理（3D 软件里表现为中键拖动不平移/环绕）。 */
+    static uint16_t rdpButtonFlags(Qt::MouseButton button) {
+        switch (button) {
+        case Qt::LeftButton:    return PTR_FLAGS_BUTTON1;
+        case Qt::RightButton:   return PTR_FLAGS_BUTTON2;
+        case Qt::MiddleButton:  return PTR_FLAGS_BUTTON3;
+        default:                return 0; /* 未知键（如侧键）不转发 */
+        }
+    }
+
     void mousePressEvent(QMouseEvent* event) override {
-        uint16_t flags = (event->button() == Qt::LeftButton) ? PTR_FLAGS_BUTTON1 | PTR_FLAGS_DOWN : PTR_FLAGS_BUTTON2 | PTR_FLAGS_DOWN;
-        mouseEventScaleSend(static_cast<uint32_t>(event->position().x()), static_cast<uint32_t>(event->position().y()), flags);
+        uint16_t flags = rdpButtonFlags(event->button());
+        if (flags == 0) { event->ignore(); return; }
+        mouseEventScaleSend(static_cast<uint32_t>(event->position().x()), static_cast<uint32_t>(event->position().y()), flags | PTR_FLAGS_DOWN);
         event->accept();
     }
     void mouseReleaseEvent(QMouseEvent* event) override {
-        uint16_t flags = (event->button() == Qt::LeftButton) ? PTR_FLAGS_BUTTON1 : PTR_FLAGS_BUTTON2;
+        uint16_t flags = rdpButtonFlags(event->button());
+        if (flags == 0) { event->ignore(); return; }
         mouseEventScaleSend(static_cast<uint32_t>(event->position().x()), static_cast<uint32_t>(event->position().y()), flags);
         event->accept();
     }

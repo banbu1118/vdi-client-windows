@@ -58,7 +58,11 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
 
 ### 2.5 本地补丁（相对上游 3.28.0）
 
-**当前 `freerdp-3.28.0/` 已非上游原样，`libfreerdp/common/settings.c` 有一处必要补丁；若重新解压源码包，该补丁会丢失，需重新应用并重新编译。**
+**当前 `freerdp-3.28.0/` 已非上游原样，共有四处本地补丁：`libfreerdp/common/settings.c` 的功能性修复（2.5.1）、`channels/rdpgfx/client/rdpgfx_codec.c` 的日志治理（2.5.2）、`channels/rdpecam/client/camera_device_main.c` 的摄像头候选格式表（2.5.3）、`libfreerdp/codec/video.c` 的 H.264 码控（2.5.4）；若重新解压源码包，四处补丁都会丢失，需重新应用并重新编译。**
+
+**产物归属**：2.5.1/2.5.4 落在 `libfreerdp`（产物 **`freerdp3.dll`**），2.5.2/2.5.3 落在 `channels/`（OBJECT 库，对象文件链入 **`freerdp-client3.dll`**）。两处 DLL 都要同步到 `freerdp-3.28.0/install/bin/` 与 `qfreerdp-windows/build/`，否则打包带的是旧库。
+
+#### 2.5.1 `settings.c`：`freerdp_addin_argv_new()` 的 NULL 参数（功能性修复）
 
 - **位置**：`libfreerdp/common/settings.c` 的 `freerdp_addin_argv_new()`。
 - **问题**：该函数对参数数组逐项执行 `_strdup()`，任一元素为 `NULL` 即 `goto fail` 并返回 `NULL`。而 `RDPDR_DRIVE` 的 `automount` 语义恰恰是"第 3 个参数为 `nullptr`"——同文件 `freerdp_device_new()` 中 `if (count > 2) device->u.drive.automount = (args[2] == nullptr);`。WinPR 的 `_strdup(NULL)` 返回 `NULL`，于是整张参数表构造失败。
@@ -67,6 +71,38 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
   - `if (!argv[x]) continue;`
 - **验证**：打补丁后客户端日志出现 `Loading device service drive [C] (static)`、`registered [    drive] device #1:     C`、`send [PAKID_CORE_DEVICELIST_ANNOUNCE] [2]`，服务端回 `PAKID_CORE_DEVICE_REPLY ... status=0x00000000`。
 - **注意**：补丁落在 `libfreerdp`，编译产物是 **`freerdp3.dll`**（不是 `freerdp-client3.dll`），部署与打包时必须一并更新。
+
+#### 2.5.2 `rdpgfx_codec.c`：关闭每帧 codec 日志（日志治理）
+
+- **位置**：`channels/rdpgfx/client/rdpgfx_codec.c` 的 `rdpgfx_decode()`（按 `cmd->codecId` 分支的四条 INFO）。
+- **问题**：AV1 / AVC420 / AVC444 / OTHER 四条 `WLog_Print(..., WLOG_INFO, "rdpgfx_decode: codec=…")` 位于**每帧解码**路径上——服务端每发一帧就打印一次，AVC444 场景下 30~60 行/秒。
+- **影响**：日志走 WinPR 默认 Console appender，落地是 `fprintf(stdout, …)`，且该输出**在持有 appender 临界区期间完成**（`WLog_Write()`），而终端渲染是这条链上最贵的一环。后果是解码线程每帧多一次格式化 + I/O、延迟抖动，并与其他线程（输入/rdpdr/urbdrc）的日志互相排队；若终端被"标记/选择"阻塞、或输出被重定向到慢速管道/磁盘，解码线程会**持锁阻塞**，表现为画面冻结、键鼠无响应。仅影响性能与体验，**不涉及协议或画面正确性**。
+- **补丁**：用块注释包住这四条 INFO，**保留同名 `WLog_ERROR`**（如 `rdpgfx_decode_AVC444 failed with error …`）。`case` 标签、解码调用与 `logSurfaceCommand()` 均未改动。
+- **验证**：重编后二进制扫描确认不再含 `rdpgfx_decode: codec=`，仍含 `rdpgfx_decode_AVC444 failed`。
+- **注意**：补丁落在 `channels/rdpgfx/client`，该目标为 **OBJECT 库**（`channels/CMakeLists.txt` 的 `add_library(... OBJECT ...)`），对象文件链入 **`freerdp-client3.dll`**（**不是 `freerdp3.dll`**）。增量重编只需 `cmake --build build --target freerdp-client`（仅重编该 .c 并重链 DLL），但要同步 `freerdp-3.28.0/install/bin/` 与 `qfreerdp-windows/build/` 两处副本，否则打包带的是旧库。
+- **不改源码的备选**：命令行加 `/log-filters:com.freerdp.channels.rdpgfx.client:ERROR`，代价是该 tag 下**所有** INFO 一并被压掉。
+
+#### 2.5.3 `camera_device_main.c`：摄像头候选格式表（H264 优先 + 补 NV12/I420）
+
+- **位置**：`channels/rdpecam/client/camera_device_main.c` 的 `getSupportedFormats()`。
+- **机制**：该函数生成"摄像头侧 → 网络侧"的格式对候选表。双层循环**外层 `i` 是网络侧输出格式、内层 `j` 是摄像头侧输入格式**，因此表内**首项即最终选中的格式对**；HAL 再用候选的输入格式去匹配摄像头原生 MF 子类型，命中第一个即选定，并把上报列表中所有条目的 `Format` 统一改写为该候选的输出格式。
+- **问题 1（带宽，20~30 Mbps）**：原候选表为 `{MJPG, H264, YUY2}`，展开后首项是 `(MJPG→MJPG)`。`src == dst` 时 `freerdp_video_sample_convert()` 只做**原样拷贝、完全不编码**，于是上行就是摄像头自身的 MJPEG 码流——外接 1080p 摄像头实测占用 20~30 Mbps，且客户端 CPU 零开销（`video_get_h264_bitrate()` 算出的 2700 kbps 只是打印出来，从未生效）。
+- **问题 2（兼容性，NV12 机型不可用）**：候选表只含 3 种格式，而 `ecamToVideoFormat()` / `ecamToMfSubtype()` 其实**早已实现** NV12、I420、RGB24、RGB32 的映射与转换；HAL 侧又设了 `MF_READWRITE_DISABLE_CONVERTERS=TRUE`（禁止 MF 自动插入转换器），所以**原生只出 NV12 的机型（部分笔记本内建、Surface 系、红外摄像头）会直接被拒**，报"不支持任何兼容格式"。
+- **补丁**：
+  1. `baseAvailable` 改为 `{H264, MJPG, YUY2, NV12, I420}`，候选顺序变为 `(H264,H264) > (MJPG,H264) > (YUY2,H264) > (NV12,H264) > (I420,H264) > …`，即"**原生 H264 直通 > 软件转码为 H264 > 原样直通**"。
+  2. **新增 `isNetworkFormat()` 白名单，跳过以 NV12/I420 为输出（dst）的组合**。这一步必须做：外层 `i` 就是上行输出格式，NV12/I420 是**未压缩原始 YUV**（1080p NV12 ≈ 3 MB/帧 ≈ 750 Mbps），一旦被选为输出会把整帧裸数据推给服务端，比改造前更糟。白名单维持原有三种输出格式不变。
+- **行为影响**：对已支持的摄像头**完全等价**（先命中 `(MJPG,H264)` 或 `(YUY2,H264)`，与改造前一致）；只有纯 NV12/I420 设备从"直接报错"变为"走 NV12→H264 转码"。
+- **验证**：日志 `[ecam_dev_print_media_type]: Format:` 由 `2`(MJPEG) 变为 `1`(H264)；实测带宽 20~30 Mbps → **2.71 Mbps**（详见 3.8）。
+- **注意**：补丁落在 `channels/rdpecam/client`，该目标为 **OBJECT 库**，对象文件链入 **`freerdp-client3.dll`**；增量重编 `cmake --build build --target freerdp-client`。
+
+#### 2.5.4 `video.c`：H.264 码控 CQP → VBR
+
+- **位置**：`libfreerdp/codec/video.c` 的 `freerdp_video_context_reconfigure()`。
+- **问题**：该函数在设置目标码率（`H264_CONTEXT_OPTION_BITRATE`）之后，把码控模式写死为 `H264_RATECONTROL_CQP` 并固定 `QP = 26`。两个编码后端都会因此**忽略码率**——OpenH264 走 `RC_OFF_MODE`（码率字段不参与）、libavcodec 走 `"qp"` 选项。结果是码率只由 QP 决定、随画面复杂度自由浮动，1080p 动态画面可冲到 20~30 Mbps，**码率完全不可控**。
+- **补丁**：改为 `H264_RATECONTROL_VBR`，并删除已失效的 `H264_CONTEXT_OPTION_QP` 设置（VBR 下两个后端都不读它）。总改动 2 行。
+- **后端行为**：libavcodec → `bit_rate`；OpenH264 → `RC_BITRATE_MODE` + `iTargetBitrate` + `bEnableFrameSkip`（超码率丢帧）。两条路径都已核对。
+- **影响面**：该函数在源码树内的**唯一调用者**是 rdpecam 的 `ecam_encoder_context_init()`，不影响 rdpgfx 的屏幕编码。
+- **注意**：补丁落在 `libfreerdp`，产物是 **`freerdp3.dll`**（不是 `freerdp-client3.dll`）；增量重编 `cmake --build build --target freerdp`。
 
 ---
 
@@ -101,12 +137,12 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
 - **动态分辨率**：基于窗口实际物理尺寸（考虑 HiDPI 的 devicePixelRatio，按 4 对齐）通过 disp 通道 `SendMonitorLayout` 下发，并跟踪 GFX_RESET 结果；连接前也设置 monitor layout 与 DesktopWidth/Height。
 - **剪贴板双向**：文本（CF_UNICODETEXT）、图片（CF_DIB/DIBV5/PNG）、文件（FileGroupDescriptorW 双向传输）。
 - **USB 重定向**：工具栏 USB 弹窗选择设备（libusb 枚举 + `WM_DEVICECHANGE` 插拔自动刷新），确认后通过 `urbdrc` 动态通道重定向并自动重连；默认发 `id:VID:PID`，检测到同型号多支时整次连接改为 `addr:bus:addr`（详见 3.7）。已被磁盘重定向接管的存储类设备在列表中**置灰并标注盘符**、不可勾选；复合设备（存储接口之外还有自定义接口）**不整体置灰**，仅标注提示（详见 3.6.2、3.7）。
-- **摄像头/麦克风重定向**：rdpecam（WMF 后端，`device:*`）、audin（WinMM，检测到麦克风才启用）。
+- **摄像头/麦克风重定向**：rdpecam（WMF 后端，`device:*`；格式协商、转码与码率见 3.8）、audin（WinMM，检测到麦克风才启用）。
 - **磁盘重定向**：支持 `/drive:name,path`（显式路径）与 `/drives`（通配，重定向本机**所有**有盘符的卷：系统盘、内置固定盘、U 盘、移动硬盘、网络盘，不做收敛）；与 USB 透传互斥，详见 3.6。
 - **连接参数**：兼容 FreeRDP 命令行（`/v:`、`/u:`、`/p:`、`/cert:ignore`、`/f`、`/clipboard:`、`/usb:`、`/drive:`），也支持 `.rdp` 文件；忽略 `.rdp` 内分辨率、强制使用窗口/屏幕尺寸。
 - **稳定性**：TCP 连接超时 15s、瞬态失败自动重试 3 次、USB 变化自动重连、证书忽略验证、GFX 开启（H264 + AVC444/444v2、ThinClient）。
 
-### 3.5 快捷键拦截（WH_KEYBOARD_LL 键盘钩子）
+### 3.5 键鼠输入转发（键盘钩子 + 鼠标按键映射）
 
 **机制**：客户端窗口处于前台（获得焦点）时安装 `WH_KEYBOARD_LL` 低级键盘钩子，离开前台自动卸载（不影响其他应用）。钩子在系统把按键路由给任何窗口/本地 shell 之前执行——对需要拦截的按键返回非零以在本地吞掉，同时把按键序列以 RDP 扫描码通过 `freerdp_input_send_keyboard_event_ex` 转发给远端会话。实现位于 `rdp-view-item.h`（`enableKeyboardHook` / `handleLowLevelKey` / `forwardRdpKey`）。
 
@@ -159,6 +195,25 @@ freerdp-3.28.0（RDP 协议引擎 / 底层库）
 | `Win+Tab` / `Win+方向键` | 由 DWM 在系统层处理，用户态钩子无法可靠拦截 |
 | `Alt+Esc` | 系统保留的 shell 窗口循环组合，未拦截，本地生效 |
 
+#### 3.5.1 鼠标按键与滚轮（中键）
+
+**实现**：`rdp-view-item.h`（`RdpViewItem`）的 `mousePressEvent` / `mouseReleaseEvent` / `mouseMoveEvent` / `hoverMoveEvent` / `wheelEvent`。坐标先经 `mouseEventScaleSend()` 按远端桌面尺寸换算，再通过 `freerdp_input_send_mouse_event()` 下发。
+
+**按键映射**（`rdpButtonFlags()`，Qt 按键 → RDP 标志位）：
+
+| Qt 按键 | RDP 标志 | 值 | 含义 |
+|---|---|---|---|
+| `Qt::LeftButton` | `PTR_FLAGS_BUTTON1` | 0x1000 | 左键 |
+| `Qt::RightButton` | `PTR_FLAGS_BUTTON2` | 0x2000 | 右键 |
+| `Qt::MiddleButton` | `PTR_FLAGS_BUTTON3` | 0x4000 | **中键（滚轮按下）** |
+| 其它（侧键等） | `0` | — | 返回 0 时 `event->ignore()`，既不在本地吞掉也不转发 |
+
+- **按下 / 弹起**：按下发 `rdpButtonFlags(button) | PTR_FLAGS_DOWN`，弹起只发键位、不带 `DOWN`。RDP 侧三个键位（`BUTTON1/2/3`）互不相同，必须逐一对应，不能二选一。
+- **移动**：`mouseMoveEvent` / `hoverMoveEvent` 只发 `PTR_FLAGS_MOVE`，**不带按键位**——按住哪个键由服务端自行维护状态，与 FreeRDP 官方 Windows 客户端 `wf_event.c` 的 `WM_MOUSEMOVE` 处理一致。因此"按住某键拖动"的正确性完全取决于按下/弹起的映射是否准确。
+- **滚轮**：`wheelEvent` 发 `PTR_FLAGS_WHEEL`，负向增量附加 `PTR_FLAGS_WHEEL_NEGATIVE`，低 8 位（`WheelRotationMask`）携带 `|delta|`；与按键映射相互独立。
+
+**此前缺陷（已修复）**：按下/弹起原为 `(event->button() == Qt::LeftButton) ? PTR_FLAGS_BUTTON1 : PTR_FLAGS_BUTTON2` 的二选一写法，**中键因此被当作右键发送**（弹起同样发右键）。在 3D 设计软件中按住滚轮拖动本应平移/环绕视图，实际变成右键拖动，表现为画面无响应或弹出右键菜单。现改为三键逐一映射，中键正确走 `PTR_FLAGS_BUTTON3`。
+
 ### 3.6 磁盘重定向（`/drives` 通配）与 USB 互斥
 
 **背景**：部分 U 盘（尤其固态 U 盘）走 `urbdrc` USB 透传时在 Win10 虚拟机内无法识别，而磁盘重定向（rdpdr + `drive` 设备服务）走的是另一条更稳定的通道。因此策略是——**只要本次连接启用了磁盘重定向，就把本机全部有盘符的卷都通过磁盘重定向送进 VM；已被磁盘重定向的存储设备不再出现在 USB 透传列表里**。
@@ -183,7 +238,7 @@ qf-client **不再做任何私有展开**，只依赖官方链路：
 3. `first_hotplug()` 执行时通道仍在 `RDPDR_CHANNEL_STATE_INITIAL`，设备先注册进 devman 缓存；待协商到 `READY` 并收到 `PAKID_CORE_USER_LOGGEDON` 后，统一以 `PAKID_CORE_DEVICELIST_ANNOUNCE` 公告，服务端逐个回 `PAKID_CORE_DEVICE_REPLY status=0`。
 4. 连接后由 rdpdr 官方热插拔线程监听 `WM_DEVICECHANGE`（`DBT_DEVICEARRIVAL` / `DBT_DEVICEREMOVECOMPLETE`）完成插入自动出现盘符、拔出自动消失。
 
-> **前置依赖**：该通配路径依赖 §2.5 的 FreeRDP 本地补丁，否则 `first_hotplug()` 枚举通过后 `rdpdr_load_drive()` 会静默失败，VM 内不会有任何盘符。
+> **前置依赖**：该通配路径依赖 §2.5.1 的 FreeRDP 本地补丁，否则 `first_hotplug()` 枚举通过后 `rdpdr_load_drive()` 会静默失败，VM 内不会有任何盘符。
 
 **已移除的旧实现**：旧版 qf-client 自己解析 `/drives` 并展开成若干 `/drive:` 私有参数，只收 `DRIVE_FIXED`、是静态快照（插入/拔出不生效），且会与官方 `first_hotplug()` 对同一盘符重复注册（同名同路径、`automount` 一真一假）。现已整体删除。
 
@@ -249,7 +304,61 @@ FreeRDP 官方语法（`client/common/cmdline.h`）：`/usb:[dbg,][id:<vid>:<pid
 - **UsbDk 必须安装**（`libusb_set_option(LIBUSB_OPTION_USE_USBDK)`；安装包内置 `UsbDk_1.0.22_x64.msi`），否则设备枚举/占用可能失败。
 - 加密狗常被厂商驱动独占，透传前可能需要在**本机**停掉厂商服务。
 
-### 3.8 构建与部署（build-qf-client.ps1）
+### 3.8 摄像头重定向：格式选择与转码码率
+
+**协商链路**：`getSupportedFormats()` 生成"摄像头侧格式 → 网络侧格式"候选表 → HAL（WMF）用候选的**输入格式**匹配摄像头原生 MF 子类型（`GetMediaTypeDescriptions`，内部 `GetNativeMediaType` 遍历全部原生类型）→ 命中**第一个**候选即选定格式对 → 上报媒体类型列表中所有条目的 `Format` 统一改写为该候选的**输出格式** → 每帧经 `ecam_encoder_compress()` → `freerdp_video_sample_convert()` 转换/编码后上行。
+
+**候选表顺序（本地补丁，详见 §2.5.3）**：
+
+| 序 | 格式对（输入→输出） | 适配的摄像头 |
+|---|---|---|
+| 0 | H264 → H264 | 原生 H264 的会议摄像头，**直通零编码** |
+| 1 | MJPG → H264 | 主流 USB 摄像头（解 MJPEG 后重编码） |
+| 2 | YUY2 → H264 | 仅出 YUY2 的设备 |
+| 3 | NV12 → H264 | 仅出 NV12 的设备（部分笔记本内建 / Surface 系 / 红外） |
+| 4 | I420 → H264 | 仅出 I420 的设备 |
+| 5+ | MJPG→MJPG、MJPG→YUY2、YUY2→YUY2 等 | 原始/直通组合，**实际不可达**（前面必先命中 `→H264`） |
+
+**为什么"顺序"就是"带宽"**：`src == dst` 时 `freerdp_video_sample_convert()` 走原样拷贝分支，**一帧都不编码**；而 H264 输出的候选排在最前，任何被支持的摄像头都会先命中 `→H264`，从而进入转码链路。
+
+**码率**：目标码率由 `h264_get_max_bitrate(height)` 按高度查表（1080→2700、720→1250、480→700、360→400、240→170、180→140 kbps）；`ecam_encoder_context_init()` 传 `bitrate=0` 触发自动计算，再用 **VBR** 下发才能真正生效（本地补丁，详见 §2.5.4）。若仍是 CQP，码率随画面复杂度自由浮动、不可控。
+
+**实测（外接 USB 摄像头 `vid_4a54&pid_5232`，1920×1080@30fps）**：
+
+| 项目 | 改造前 | 改造后 |
+|---|---|---|
+| 上报格式 | `Format: 2`（MJPEG） | `Format: 1`（H264） |
+| 上行带宽 | 20~30 Mbps | **2.71 Mbps** |
+| 客户端开销 | 无（原样直通） | 每帧 MJPEG 解码 + 色彩转换 + H.264 软编 |
+
+改造后统计口径（`/log-level:DEBUG` 抓包聚合）：5912 帧 / 63.78 MB / 平均 11.05 KB/帧 / 帧大小 0.71~54.76 KB（关键帧）。全程仅 1 帧因摄像头吐出残缺 JPEG 被丢弃（`No JPEG data found`；客户端设了 `AV_EF_EXPLODE`，坏帧整帧丢弃而不硬解，属预期容错）。
+
+**日志观察点**：`[ecam_dev_print_media_type]: Format: 1`（1=H264、2=MJPG、3=YUY2、4=NV12、5=I420）确认选中的输出格式；`[video_get_h264_bitrate]: Auto-calculated H.264 bitrate: 2700 kbps` 确认目标码率。注意后者每帧打印一次（`ecam_encoder_compress()` 每帧都会调 `ecam_encoder_context_init()`），DEBUG 级别下日志量较大。
+
+**兼容性（按闸门判定）**：
+
+| 摄像头 | 原生格式 | 结果 |
+|---|---|---|
+| 主流 USB 摄像头 | MJPG + YUY2 | ✅ MJPG→H264 |
+| 工业相机 / 低端设备 | 仅 YUY2 | ✅ YUY2→H264 |
+| 会议摄像头 | 原生 H264 | ✅ 直通，零 CPU |
+| 笔记本内建 / Surface 系 | 仅 NV12 或 I420 | ✅ NV12/I420→H264（§2.5.3 新增） |
+| 虚拟相机 / 采集卡 | 仅 RGB24/RGB32 | ❌ 报"不支持任何兼容格式"（映射与转换已实现但未纳入候选表） |
+| 红外/深度（Windows Hello） | NV12，多流 | ⚠️ 格式可协商，但只读第一条视频流 |
+| 仅 DirectShow 的虚拟摄像头/老采集卡 | — | ❌ MF 枚举不到，设备列表里根本不出现 |
+
+**已知缺口与风险**：
+
+1. **行跨度（stride）假设**：原始格式按"行紧密排列"推算平面地址（`freerdp_video_fill_plane_info()` 用 `av_image_fill_pointers` 按 width 推 stride），未读取 MF 的 `MF_MT_DEFAULT_STRIDE`。若某驱动样本带行填充或负跨度，NV12/YUY2 画面会出现**斜切/错位**。
+2. **H264 直通不做码流形态校验**：不检查起始码/SPS-PPS。若摄像头输出的 H264 形态服务端不认，表现为黑屏且日志无线索。
+3. **服务端需具备 H264 解码能力**：现在**默认**输出 H264，且客户端**没有**"被服务端拒绝就退回 MJPEG"的回退逻辑。目标环境若为异构 Windows 版本群，需单独评估。
+4. **只支持第一条视频流**：HAL 固定用 `MF_SOURCE_READER_FIRST_VIDEO_STREAM`，传入的 `streamIndex` 仅记录不生效；每设备只维护一个 stream 对象（按 deviceId 索引）。
+5. **独占占用**：摄像头被本机其它程序（Teams/相机应用）占用时打不开，仅 5 次重试 × 400ms。
+6. **本地 USB 侧不受优化**：始终按摄像头"第一条匹配的原生类型"取流（`stream->nativeMediaType`，**忽略**服务端请求的尺寸），带宽优化只作用于 RDP 上行；服务端选小分辨率时靠 sws 静默缩放，本地仍跑满原生分辨率。
+7. **帧率整数除法**：`fr = FrameRateNumerator / FrameRateDenominator`（29.97→29），且对分母为 0 无兜底——服务端下发的媒体类型会校验分母非 0，但列表首项（摄像头原生值）直接作为 `currMediaType` 时不校验。
+8. **上报列表带重复**：同一分辨率会按命中的候选数重复出现（原 25 条），服务端可接受但不规范。
+
+### 3.9 构建与部署（build-qf-client.ps1）
 1. 依赖校验：FreeRDP install 目录、vcpkg toolchain、Qt 6.11.1、VS2022。
 2. CMake + Ninja + MSVC 编译出 `qf-client.exe`。
 3. 部署运行时到 build 目录：
@@ -258,7 +367,7 @@ FreeRDP 官方语法（`client/common/cmdline.h`）：`/usb:[dbg,][id:<vid>:<pid
    - FFmpeg（avcodec/avformat/avutil 等）、OpenH264、libx264、zlib；
    - Qt 核心/Quick/Controls 相关 DLL、`platforms/qwindows.dll`、imageformats、iconengines、QML 模块（QtQml/QtQuick/...）、MSVC 运行时（VC143 CRT）。
 
-### 3.9 运行示例
+### 3.10 运行示例
 ```
 qf-client.exe /v:192.168.1.90 /u:administrator /p:123456 /cert:ignore /f
 ```
@@ -268,7 +377,7 @@ qf-client.exe /v:192.168.1.90 /u:administrator /p:123456 /cert:ignore /f
 ## 四、vdi-client-windows-main（VDI 管理客户端，VDIClient.exe）
 
 ### 4.1 项目性质
-- 基于 **Qt 6（Widgets + Network）** 的 VDI 管理客户端，版本 **1.6.0**（CMake 中 `project(VDIClient VERSION 1.6.0)`，安装包版本同步见 `installer.iss` 的 `MyAppVersion`）。
+- 基于 **Qt 6（Widgets + Network）** 的 VDI 管理客户端，版本 **1.6.1**（CMake 中 `project(VDIClient VERSION 1.6.1)`，安装包版本同步见 `installer.iss` 的 `MyAppVersion`）。
 - 语言标准：**C++17**，构建工具 CMake（仓库内 `build/` 为 MSVC 的 VS 工程产物，含 `VDIClient.sln`）。
 - 功能定位：登录 → 虚拟机列表管理 → 拉起 RDP 客户端（qf-client.exe）完成远程连接。
 
@@ -311,3 +420,5 @@ qf-client.exe /v:192.168.1.90 /u:administrator /p:123456 /cert:ignore /f
 6. **多进程协作**：VDIClient.exe（管理面）与 qf-client.exe（数据面）解耦，通过 QProcess + 命令行参数（含 .rdp 文件）协作。
 7. **构建链**：vcpkg（依赖）→ FreeRDP（build-freerdp.ps1，**含 §2.5 本地补丁**）→ qf-client（build-qf-client.ps1）→ VDIClient（CMake 拷贝 bin/ 打包）。改 FreeRDP 源码后必须重编并同步 `freerdp3.dll` / `freerdp-client3.dll` / `winpr3.dll`，否则包里的客户端仍带旧库。
 8. **系统快捷键拦截（qf-client）**：`WH_KEYBOARD_LL` 低级键盘钩子仅在客户端窗口前台时启用，本地吞掉 Win/Win+字母/Alt+Tab/PrintScreen 及被本地热键抢占的 Ctrl+Space/Ctrl+Shift+Esc/Ctrl+Esc 并转发到 RDP 会话（详见 3.5）；`Win+L` 与 `Ctrl+Alt+Del` 属系统安全边界，用户态无法拦截——Win+L 锁本地机器（同 mstsc），Ctrl+Alt+Del 由工具栏按钮发送。键盘事件转发采用"映射表优先、盲区回退物理扫描码"策略，保证 Delete/方向键等扩展键的 RDP 扩展位正确。
+9. **鼠标按键映射（qf-client）**：Qt 三键逐一映射到 RDP 键位（左/右/中 → `PTR_FLAGS_BUTTON1/2/3`，按下额外带 `PTR_FLAGS_DOWN`），未知键返回 0 后 `event->ignore()` 直接放行；移动事件只发 `PTR_FLAGS_MOVE`、**不带按键位**，拖动状态由服务端维护；滚轮走 `PTR_FLAGS_WHEEL` + 低 8 位增量（负向附加 `PTR_FLAGS_WHEEL_NEGATIVE`）。此前中键被误当作右键（二选一写法），导致 3D 软件中按住滚轮拖动无效（详见 3.5.1）。
+10. **摄像头重定向（rdpecam）**：带宽取决于**候选格式表的顺序**——`src == dst` 时 `freerdp_video_sample_convert()` 只做原样拷贝、**完全不编码**，所以把 `→H264` 的候选排在首位才进入转码链路。本地补丁把候选表改为 `H264 优先 + 补 NV12/I420`，并把 H.264 码控由 CQP 改为 VBR 让目标码率真正生效（详见 §2.5.3、§2.5.4、§3.8）。实测外接 1080p 摄像头由 20~30 Mbps 降至 **2.71 Mbps**。NV12/I420 只作为**输入**格式，由 `isNetworkFormat()` 白名单排除在上行输出之外（裸 YUV 上行 1080p 约 750 Mbps）。

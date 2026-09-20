@@ -266,12 +266,16 @@ UINT rdpgfx_decode(RDPGFX_PLUGIN* gfx, RDPGFX_SURFACE_COMMAND* cmd)
 	{
 #if defined(WITH_GFX_AV1)
 		case RDPGFX_CODECID_AV1:
+			/* 每个 AV1 帧都会打印一次，日志噪音过大，如需排查可取消注释
 			WLog_Print(gfx->base.log, WLOG_INFO, "rdpgfx_decode: codec=AV1 (0x%04" PRIx16 ")",
 			           cmd->codecId);
+			*/
 #endif
 		case RDPGFX_CODECID_AVC420:
+			/* 每个 AVC420 帧都会打印一次，日志噪音过大，如需排查可取消注释
 			WLog_Print(gfx->base.log, WLOG_INFO, "rdpgfx_decode: codec=AVC420 (0x%04" PRIx16 ")",
 			           cmd->codecId);
+			*/
 			if ((error = rdpgfx_decode_AVC420(gfx, cmd)))
 				WLog_Print(gfx->base.log, WLOG_ERROR,
 				           "rdpgfx_decode_AVC420 failed with error %" PRIu32 "", error);
@@ -280,8 +284,10 @@ UINT rdpgfx_decode(RDPGFX_PLUGIN* gfx, RDPGFX_SURFACE_COMMAND* cmd)
 
 		case RDPGFX_CODECID_AVC444:
 		case RDPGFX_CODECID_AVC444v2:
+			/* 每个 AVC444 帧都会打印一次，日志噪音过大，如需排查可取消注释
 			WLog_Print(gfx->base.log, WLOG_INFO, "rdpgfx_decode: codec=AVC444 (0x%04" PRIx16 ")",
 			           cmd->codecId);
+			*/
 			if ((error = rdpgfx_decode_AVC444(gfx, cmd)))
 				WLog_Print(gfx->base.log, WLOG_ERROR,
 				           "rdpgfx_decode_AVC444 failed with error %" PRIu32 "", error);
@@ -289,8 +295,10 @@ UINT rdpgfx_decode(RDPGFX_PLUGIN* gfx, RDPGFX_SURFACE_COMMAND* cmd)
 			break;
 
 		default:
+			/* 每个未知 codec 帧都会打印一次，日志噪音过大，如需排查可取消注释
 			WLog_Print(gfx->base.log, WLOG_INFO, "rdpgfx_decode: codec=OTHER (0x%04" PRIx16 ")",
 			           cmd->codecId);
+			*/
 			error = logSurfaceCommand(gfx, cmd);
 			break;
 	}

@@ -269,11 +269,11 @@ BOOL freerdp_video_context_reconfigure(FREERDP_VIDEO_CONTEXT* context, UINT32 wi
 	if (!h264_context_set_option(context->h264, H264_CONTEXT_OPTION_BITRATE, bitrate))
 		goto fail;
 
+	/* 本地补丁：原为 CQP + 固定 QP 26，编码器走固定 QP 模式，上面传入的 bitrate
+	 * 会被后端忽略，1080p 动态画面码率完全不可控（摄像头转码实测可冲到 20~30 Mbps）。
+	 * 改为 VBR 后 video_get_h264_bitrate() 算出的目标码率才真正生效。 */
 	if (!h264_context_set_option(context->h264, H264_CONTEXT_OPTION_RATECONTROL,
-	                             H264_RATECONTROL_CQP))
-		goto fail;
-
-	if (!h264_context_set_option(context->h264, H264_CONTEXT_OPTION_QP, 26))
+	                             H264_RATECONTROL_VBR))
 		goto fail;
 
 	if (!h264_context_set_option(context->h264, H264_CONTEXT_OPTION_HW_ACCEL, FALSE))

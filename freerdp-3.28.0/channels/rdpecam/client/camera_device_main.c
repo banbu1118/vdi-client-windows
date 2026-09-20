@@ -35,16 +35,40 @@
  * @param pCount Output parameter for number of formats
  * @return Pointer to format array
  */
+/* 本地补丁：允许作为“网络侧输出格式”的集合。
+ * NV12 / I420 是未压缩的原始 YUV（1080p NV12 约 3 MB/帧），一旦被选为输出格式，
+ * 就会把整帧裸数据推给服务端，因此只允许它们出现在摄像头侧（输入格式）候选里。
+ * 这里维持原有的三种输出格式不变。 */
+static BOOL isNetworkFormat(CAM_MEDIA_FORMAT fmt)
+{
+	switch (fmt)
+	{
+		case CAM_MEDIA_FORMAT_H264:
+		case CAM_MEDIA_FORMAT_MJPG:
+		case CAM_MEDIA_FORMAT_YUY2:
+			return TRUE;
+		default:
+			return FALSE;
+	}
+}
+
 static const CAM_MEDIA_FORMAT_INFO* getSupportedFormats(size_t* pCount)
 {
 	WINPR_ASSERT(pCount);
 
-	/* Format priority: MJPG > H264 > YUY2.
-	 * Only passthrough pairs (src==dst) matter here — the camera either
-	 * supports the format natively or it doesn't. No software conversion. */
-	const CAM_MEDIA_FORMAT baseAvailable[] = { CAM_MEDIA_FORMAT_MJPG,
-		                                        CAM_MEDIA_FORMAT_H264,
-		                                        CAM_MEDIA_FORMAT_YUY2 };
+	/* 本地补丁：输出格式优先级改为 H264 > MJPG > YUY2（外层 i 为 dst，内层 j 为 src，
+	 * 列表按 dst 再按 src 排列，故首项即为最终选中的格式对）。
+	 * 候选顺序为 (H264,H264) > (MJPG,H264) > (YUY2,H264) > (MJPG,MJPG) > ...，
+	 * 即“摄像头原生 H264 直通 > 软件转码为 H264 > 原样直通”。
+	 * 原顺序 MJPG 优先时 (MJPG,MJPG) 排首位，上报的媒体类型全是 MJPEG，
+	 * 客户端一帧都不编码，外接摄像头实测占用 20~30 Mbps。
+	 *
+	 * 本地补丁：摄像头侧补充 NV12 / I420——很多机型（含部分笔记本内建摄像头与
+	 * Surface 系）原生只出 NV12，此前会直接报“不支持任何兼容格式”。
+	 * 它们只作为输入格式，由 isNetworkFormat() 排除在上行输出之外。 */
+	const CAM_MEDIA_FORMAT baseAvailable[] = { CAM_MEDIA_FORMAT_H264, CAM_MEDIA_FORMAT_MJPG,
+		                                        CAM_MEDIA_FORMAT_YUY2, CAM_MEDIA_FORMAT_NV12,
+		                                        CAM_MEDIA_FORMAT_I420 };
 	static CAM_MEDIA_FORMAT_INFO formats[ARRAYSIZE(baseAvailable) * ARRAYSIZE(baseAvailable)];
 	static size_t count = 0;
 	static BOOL initialized = FALSE;
@@ -53,6 +77,10 @@ static const CAM_MEDIA_FORMAT_INFO* getSupportedFormats(size_t* pCount)
 	{
 		for (size_t i = 0; i < ARRAYSIZE(baseAvailable); i++)
 		{
+			/* NV12 / I420 不充当上行输出格式，跳过以它们为 dst 的组合 */
+			if (!isNetworkFormat(baseAvailable[i]))
+				continue;
+
 			for (size_t j = 0; j < ARRAYSIZE(baseAvailable); j++)
 			{
 				if (freerdp_video_conversion_supported(ecamToVideoFormat(baseAvailable[j]),
